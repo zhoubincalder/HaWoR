@@ -25,6 +25,9 @@ dependencies = [
     "timm",
     "einops",
     "yacs",
+    # The released hawor.ckpt stores its Lightning hyper_parameters as an
+    # omegaconf DictConfig, so unpickling it needs omegaconf importable.
+    "omegaconf",
     "joblib",
     "tqdm",
     "natsort",

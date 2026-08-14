@@ -154,16 +154,35 @@ space-time and motion modules expect. Notes on the setup:
 - In-plane rotation and horizontal flip augmentation are rejected by the dataset:
   rotation breaks the CLIFF bbox feature and the full-frame projection, and flipping
   a handed model is a no-op here.
-- Losses reduce with `sum()` (HaMeR convention), so their magnitude scales with
-  `BATCH_SIZE * 16`. Re-tune `LOSS_WEIGHTS` if you change the batch size a lot.
+- Losses reduce over the batch with `TRAIN.LOSS_REDUCTION`, default `mean` to
+  match the released `model_config.yaml`. `sum` gives the HaMeR convention, where
+  loss magnitude — and the effective learning rate — scales with `BATCH_SIZE * 16`.
 - Use `bf16-mixed`. `16-mixed` inserts a gradient scaler, which breaks the manual
   `clip_grad_norm_(..., error_if_nonfinite=True)` in `training_step`; `train.py`
   refuses that combination.
 
 By default the ViT-H backbone is loaded from a pretrained checkpoint and frozen
 (and kept in `eval()` mode, since it is built with `drop_path_rate=0.55`). To
-fine-tune end-to-end afterwards, set `MODEL.BACKBONE.FREEZE: False` and drop
-`TRAIN.LR` to ~1e-5.
+fine-tune end-to-end afterwards, set `MODEL.BACKBONE.FREEZE: False`.
+
+### Relationship to the released recipe
+
+`weights/hawor/model_config.yaml` ships with the pretrained weights and records how
+the released model was trained. This config matches it on architecture
+(`ST_HDIM`/`ST_NLAYER`/`MOTION_HDIM`/`MOTION_NLAYER`, `IMAGE_SIZE`), `LOSS_WEIGHTS`,
+`LR`, `WEIGHT_DECAY`, `BATCH_SIZE` and `LOSS_REDUCTION` — the architecture match is
+verified by loading `hawor.ckpt` into it with `strict=True`.
+
+Two deliberate differences:
+
+- **Rotation augmentation.** The release used `ROT_FACTOR: 30`, `ROT_AUG_RATE: 0.6`.
+  This reimplementation leaves it off, because rotating the crop only stays exact if
+  the principal point moves to the crop centre, which would zero out the CLIFF bbox
+  feature that conditions the model. The dataset raises rather than silently applying
+  an inconsistent transform.
+- **Single dataset.** The release trained `MULTI_SET` over HOT3D, ARCTIC, DexYCB and
+  HO3D at equal weight. This pipeline takes one export root; matching the release
+  means exporting the other three in the same layout and concatenating them.
 
 ## Evaluation on HOT3D
 

@@ -80,3 +80,7 @@ imgui.ini
 
 # uv-managed environment (uv.lock is committed on purpose)
 .venv/
+
+# MANO models are licence-restricted (non-commercial, no redistribution)
+_DATA/data/mano/*.pkl
+_DATA/data_left/mano_left/*.pkl

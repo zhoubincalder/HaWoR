@@ -223,7 +223,9 @@ def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
     # load infiller
     weight_path = args.infiller_weight
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    ckpt = torch.load(weight_path, map_location=device)
+    # weights_only=False: torch>=2.6 flipped the default, and these checkpoints
+    # carry non-tensor metadata.
+    ckpt = torch.load(weight_path, map_location=device, weights_only=False)
     pos_dim = 3
     shape_dim = 10
     num_joints = 15

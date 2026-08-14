@@ -25,6 +25,17 @@ from .mano_wrapper import MANO
 log = get_pylogger(__name__)
 idx = 0
 
+
+def load_checkpoint(path, map_location='cpu'):
+    """
+    torch.load for a trusted local checkpoint.
+
+    torch>=2.6 defaults to weights_only=True, which rejects the released HaWoR
+    checkpoint because Lightning stored its hyper_parameters as an omegaconf
+    DictConfig.
+    """
+    return torch.load(path, map_location=map_location, weights_only=False)
+
 class HAWOR(pl.LightningModule):
 
     def __init__(self, cfg: CfgNode):
@@ -48,23 +59,26 @@ class HAWOR(pl.LightningModule):
         # Create backbone feature extractor
         self.backbone = create_backbone(cfg)
         self.backbone_frozen = False
-        try:
-            if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
-                whole_state_dict = torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict']
-                backbone_state_dict = {}
-                for key in whole_state_dict:
-                    if key[:9] == 'backbone.':
-                        backbone_state_dict[key[9:]] = whole_state_dict[key]
-                self.backbone.load_state_dict(backbone_state_dict)
-                print(f'Loaded backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
-                if cfg.MODEL.BACKBONE.get('FREEZE', True):
-                    for param in self.backbone.parameters():
-                        param.requires_grad = False
-                    self.backbone_frozen = True
-                    print('Backbone is frozen.')
-            else:
-                print('WARNING: init backbone from sratch !!!')
-        except:
+        # NOTE: failures here are raised, not swallowed. Silently falling back to
+        # a randomly initialized ViT-H when a checkpoint was requested is almost
+        # never what the caller wants, and it is invisible in the loss curve.
+        if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
+            whole_state_dict = load_checkpoint(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS)['state_dict']
+            backbone_state_dict = {}
+            for key in whole_state_dict:
+                if key[:9] == 'backbone.':
+                    backbone_state_dict[key[9:]] = whole_state_dict[key]
+            if not backbone_state_dict:
+                raise ValueError(
+                    f'{cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS} contains no "backbone.*" keys.')
+            self.backbone.load_state_dict(backbone_state_dict)
+            print(f'Loaded backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
+            if cfg.MODEL.BACKBONE.get('FREEZE', True):
+                for param in self.backbone.parameters():
+                    param.requires_grad = False
+                self.backbone_frozen = True
+                print('Backbone is frozen.')
+        else:
             print('WARNING: init backbone from sratch !!!')
 
         # Space-time memory
@@ -105,10 +119,12 @@ class HAWOR(pl.LightningModule):
             self.backbone = torch.compile(self.backbone)
             self.mano_head = torch.compile(self.mano_head)
 
-        # Define loss functions
-        self.keypoint_3d_loss = Keypoint3DLoss(loss_type='l1')
-        self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1')
-        self.mano_parameter_loss = ParameterLoss()
+        # Define loss functions. The released model_config.yaml uses
+        # TRAIN.LOSS_REDUCTION: mean, which is what LOSS_WEIGHTS is tuned for.
+        reduction = cfg.TRAIN.get('LOSS_REDUCTION', 'mean')
+        self.keypoint_3d_loss = Keypoint3DLoss(loss_type='l1', reduction=reduction)
+        self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1', reduction=reduction)
+        self.mano_parameter_loss = ParameterLoss(reduction=reduction)
 
         # Instantiate MANO model
         mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
@@ -121,7 +137,7 @@ class HAWOR(pl.LightningModule):
         self.automatic_optimization = False
 
         if cfg.MODEL.get('LOAD_WEIGHTS', None):
-            whole_state_dict = torch.load(cfg.MODEL.LOAD_WEIGHTS, map_location='cpu')['state_dict']
+            whole_state_dict = load_checkpoint(cfg.MODEL.LOAD_WEIGHTS)['state_dict']
             self.load_state_dict(whole_state_dict, strict=True)
             print(f"load {cfg.MODEL.LOAD_WEIGHTS}")
 
