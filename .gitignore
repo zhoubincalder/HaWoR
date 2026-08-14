@@ -77,3 +77,6 @@ ipython_config.py
 
 vis.mp4
 imgui.ini
+
+# uv-managed environment (uv.lock is committed on purpose)
+.venv/
