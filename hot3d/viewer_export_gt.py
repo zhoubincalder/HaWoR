@@ -89,8 +89,13 @@ def execute_rerun(
     timestamps_slice: Type[slice],
     fail_on_missing_data: bool,
     use_slam_hamer: bool,
+    export_gt_folder: Optional[str] = None,
 ):
-    export_gt_folder = sequence_folder.replace('dataset', 'hot3d_dataset_export')
+    if export_gt_folder is None:
+        # Legacy behaviour: derive the output folder by substring substitution.
+        # Only correct when sequence_folder is literally "dataset/<name>"; pass
+        # export_gt_folder explicitly for any other layout.
+        export_gt_folder = sequence_folder.replace('dataset', 'hot3d_dataset_export')
     if not os.path.exists(export_gt_folder):
         os.makedirs(export_gt_folder)
     # if os.path.exists(os.path.join(export_gt_folder, export_gt_folder.split('/')[-1] + '.mp4')):
@@ -260,14 +265,15 @@ def main():
     except Exception as error:
         print(f"An exception occurred: {error}")
 
-def export_gt(sequence_folder, start_frame=20, debug=False):
+def export_gt(sequence_folder, start_frame=20, debug=False, export_gt_folder=None,
+              object_library_folder=None, mano_model_folder=None):
     print(sequence_folder)
     # args = parse_args()
     # print(f"args provided: {args}")
     from easydict import EasyDict as edict
     args = edict()
-    args.object_library_folder = "dataset/assets"
-    args.mano_model_folder = "mano_v1_2/models/"
+    args.object_library_folder = object_library_folder or "dataset/assets"
+    args.mano_model_folder = mano_model_folder or "mano_v1_2/models/"
     args.rrd_output_path = None
     args.jpeg_quality = 75
     args.use_slam_hamer = False
@@ -286,6 +292,7 @@ def export_gt(sequence_folder, start_frame=20, debug=False):
         timestamps_slice=slice(start_frame, len, None),
         fail_on_missing_data=False,
         use_slam_hamer=args.use_slam_hamer,
+        export_gt_folder=export_gt_folder,
     )
 
 

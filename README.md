@@ -122,10 +122,28 @@ This trains the **camera-space hand motion estimator** only. The SLAM stage uses
 frozen off-the-shelf weights (DROID-SLAM + Metric3D) and the motion infiller is a
 separate model.
 
-### 1. Prepare the sequences
+### 1. Export a training split
 
-Export and preprocess sequences exactly as for evaluation (see *Evaluation on HOT3D*),
-then split the sequence names into `train.json` / `val.json` under the export root.
+Download the sequences you want to train on (see *Evaluation on HOT3D* for the
+downloader), then export their ground truth. `export_gt.py` takes the split as an
+argument:
+
+```bash
+cd hot3d && uv run python export_gt.py --split train --all-available --dataset-root dataset --output-root hot3d_trainset_export
+```
+
+`--all-available` takes every sequence directory under `--dataset-root`, minus the 27
+evaluation sequences — those are excluded automatically for any split other than `val`,
+so a training set cannot silently contaminate your eval numbers. Use `--sequences` or
+`--sequence-file` (`.json` / `.pkl` / `.txt`) to choose explicitly, `--dry-run` to see
+the selection first, and `--skip-existing --continue-on-error` to resume a long export.
+The written `<split>.json` lists only the sequences that exported successfully.
+
+Then move the export next to the val set:
+
+```bash
+mv hot3d/hot3d_trainset_export datasets/hot3d_trainset_export
+```
 
 ### 2. Extract the ground truth
 
@@ -201,10 +219,13 @@ python3 dataset_downloader_base_main.py -c Hot3DAria_download_urls.json -o ../da
 *: Downloading and processing code under `hot3d/` is adapted from [Official HOT3D Toolkit](https://github.com/facebookresearch/hot3d).
 
 ### Extract HOT3D GT
+With no arguments `export_gt.py` exports the 27 evaluation sequences and writes
+`val.json`, exactly as before. See *Training* for building other splits.
+
 ```
 mkdir datasets
 cd hot3d
-python export_gt.py
+uv run python export_gt.py
 mv hot3d_dataset_export ../datasets/hot3d_valset_export
 ```
 
