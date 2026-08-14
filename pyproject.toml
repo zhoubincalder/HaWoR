@@ -12,9 +12,9 @@ requires-python = ">=3.10,<3.11"
 # train.py). The demo, SLAM and HOT3D toolkit dependencies live in the extras
 # below so a fragile renderer build cannot block training.
 dependencies = [
-    "torch>=2.7,<2.10",
+    "torch>=2.13,<2.14",
     "torchvision",
-    "pytorch-lightning>=2.2,<2.6",
+    "pytorch-lightning>=2.2",
     "tensorboard",
     "numpy==1.26.4",
     "opencv-python",
@@ -72,17 +72,17 @@ package = false
 [tool.uv.extra-build-dependencies]
 chumpy = ["pip"]
 
-# Blackwell (sm_120, e.g. RTX PRO 6000) needs CUDA 12.8 wheels. The torch 1.13
-# + cu117 combination in the README predates it and will fail with
+# CUDA 13.0 wheels. Blackwell (sm_120, e.g. RTX PRO 6000) needs at least cu128;
+# the torch 1.13 + cu117 combination in the README predates it and fails with
 # "no kernel image is available for execution on the device".
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 # PyPI chumpy 0.70 imports np.bool/np.int/np.float, removed in numpy>=1.24.
 chumpy = { git = "https://github.com/mattloper/chumpy" }
 

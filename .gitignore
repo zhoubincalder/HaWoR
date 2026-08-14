@@ -84,3 +84,6 @@ imgui.ini
 # MANO models are licence-restricted (non-commercial, no redistribution)
 _DATA/data/mano/*.pkl
 _DATA/data_left/mano_left/*.pkl
+
+# Downloaded datasets
+/datasets

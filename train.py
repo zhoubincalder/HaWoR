@@ -48,12 +48,20 @@ def parse_args():
                         help='Stop after this many optimizer steps. Use a small value to '
                              'smoke-test a config before committing to a long run.')
     parser.add_argument('--limit_val_batches', type=float, default=1.0)
+    parser.add_argument('--opts', nargs=argparse.REMAINDER, default=[],
+                        help='Override config entries, yacs style and last on the command '
+                             'line: --opts TRAIN.LR 1e-4 MODEL.BACKBONE.FREEZE False')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     cfg = get_config(args.cfg, merge=True, update_cachedir=True)
+    if args.opts:
+        cfg.defrost()
+        cfg.merge_from_list(args.opts)
+        cfg.freeze()
+        print(f'config overrides: {args.opts}')
 
     precision = cfg.TRAIN.get('PRECISION', 'bf16-mixed')
     if precision == '16-mixed' and cfg.TRAIN.get('GRAD_CLIP_VAL', 0) > 0:

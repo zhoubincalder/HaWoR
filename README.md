@@ -122,7 +122,27 @@ This trains the **camera-space hand motion estimator** only. The SLAM stage uses
 frozen off-the-shelf weights (DROID-SLAM + Metric3D) and the motion infiller is a
 separate model.
 
-### 1. Export a training split
+### Option A: HOT3D-Clips (no credentials needed)
+
+The full HOT3D dataset requires a credentialed download manifest from projectaria.com.
+HOT3D-Clips — curated 150-frame sub-sequences with the same annotations — is
+ungated on Hugging Face, so it needs no account:
+
+```bash
+huggingface-cli download bop-benchmark/hot3d --repo-type dataset --include 'train_aria/*' --local-dir datasets/hot3d_clips
+```
+
+```bash
+uv run python lib/datasets/hot3d_clips_to_export.py --clips_dir datasets/hot3d_clips/train_aria --out_root datasets/hot3d_clips_export --workers 16
+```
+
+The converter bridges three format gaps: 15 MANO PCA coefficients expanded to 45
+axis-angle, FISHEYE624 undistorted to a pinhole camera, and the Aria RGB rotation
+folded into the camera pose so `load_gt_cam`'s `R_90` recovers the upright camera.
+Its output feeds step 2 below unchanged. HOT3D is released under a non-commercial
+research licence (`hot3d_dataset_license_agreement.pdf` in that repo).
+
+### Option B: full HOT3D — export a training split
 
 Download the sequences you want to train on (see *Evaluation on HOT3D* for the
 downloader), then export their ground truth. `export_gt.py` takes the split as an
