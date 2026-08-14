@@ -28,9 +28,11 @@ git clone --recursive https://github.com/ThunderVVV/HaWoR.git
 cd HaWoR
 ```
 
-The Python environment is managed with [uv](https://docs.astral.sh/uv/). `pyproject.toml`
-pins Python 3.10 (chumpy, needed by smplx to unpickle the MANO models, calls the
-`inspect.getargspec` that was removed in 3.11) and installs CUDA 12.8 torch wheels.
+The Python environment is managed entirely with [uv](https://docs.astral.sh/uv/) —
+there is no conda path. `pyproject.toml` pins Python 3.10 (chumpy, needed by smplx to
+unpickle the MANO models, calls the `inspect.getargspec` removed in 3.11) and installs
+CUDA 13.0 torch wheels. Blackwell GPUs (sm_120) need at least CUDA 12.8, so the
+torch 1.13 + cu117 build this project originally used will not run on them.
 
 ```bash
 uv sync
@@ -60,30 +62,11 @@ uv pip install --no-build-isolation "git+https://github.com/facebookresearch/pyt
 uv pip install --no-build-isolation torch-scatter==2.1.2
 ```
 
-<details>
-<summary>Original conda instructions (PyTorch 1.13 / CUDA 11.7)</summary>
-
-Note that torch 1.13+cu117 predates Blackwell (sm_120) GPUs and will fail there with
-"no kernel image is available for execution on the device"; the uv setup above installs
-cu128 wheels instead.
-
-```bash
-conda create --name hawor python=3.10
-conda activate hawor
-
-pip install torch==1.13.0+cu117 torchvision==0.14.0+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
-# Install requirements
-pip install -r requirements.txt
-pip install pytorch-lightning==2.2.4 --no-deps
-pip install lightning-utilities torchmetrics==1.4.0
-```
-</details>
-
 ### Install masked DROID-SLAM:
 
 ```
 cd thirdparty/DROID-SLAM
-python setup.py install
+uv run python setup.py install
 ```
 
 Download DROID-SLAM official weights [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing), put it under `./weights/external/`.
@@ -108,12 +91,12 @@ Note that MANO model falls under the [MANO license](https://mano.is.tue.mpg.de/l
 
 For visualizaiton in world view, run with:
 ```bash
-python demo.py --video_path ./example/video_0.mp4  --vis_mode world
+uv run python demo.py --video_path ./example/video_0.mp4  --vis_mode world
 ```
 
 For visualizaiton in camera view, run with:
 ```bash
-python demo.py --video_path ./example/video_0.mp4 --vis_mode cam
+uv run python demo.py --video_path ./example/video_0.mp4 --vis_mode cam
 ```
 
 ## Training
@@ -122,7 +105,9 @@ This trains the **camera-space hand motion estimator** only. The SLAM stage uses
 frozen off-the-shelf weights (DROID-SLAM + Metric3D) and the motion infiller is a
 separate model.
 
-### Option A: HOT3D-Clips (no credentials needed)
+### 1. Get the data
+
+#### Option A: HOT3D-Clips (no credentials needed)
 
 The full HOT3D dataset requires a credentialed download manifest from projectaria.com.
 HOT3D-Clips — curated 150-frame sub-sequences with the same annotations — is
@@ -142,7 +127,7 @@ folded into the camera pose so `load_gt_cam`'s `R_90` recovers the upright camer
 Its output feeds step 2 below unchanged. HOT3D is released under a non-commercial
 research licence (`hot3d_dataset_license_agreement.pdf` in that repo).
 
-### Option B: full HOT3D — export a training split
+#### Option B: full HOT3D — export a training split
 
 Download the sequences you want to train on (see *Evaluation on HOT3D* for the
 downloader), then export their ground truth. `export_gt.py` takes the split as an
@@ -232,8 +217,8 @@ Download a copy of MANO offical website model(`mano_v1_2.zip`) and put them to `
 
 ```
 cd hot3d/data_downloader
-python3 dataset_downloader_base_main.py -c Hot3DAssets_download_urls.json -o ../dataset --sequence_name all
-python3 dataset_downloader_base_main.py -c Hot3DAria_download_urls.json -o ../dataset --data_types all --sequence_name P0001_a68492d5 P0001_9b6feab7 P0014_8254f925 P0011_76ea6d47 P0014_84ea2dcc P0001_8d136980 P0012_476bae57 P0012_130a66e1 P0014_24cb3bf0 P0010_1c9fe708 P0002_2ea9af5b P0011_11475e24 P0010_0ecbf39f P0010_160e551c P0015_42b8b389 P0012_915e71c6 P0002_65085bfc P0011_47878e48 P0011_cee8fe4f P0002_016222d1 P0012_d85e10f6 P0012_119de519 P0010_41c4c626 P0012_f7e3880b P0009_02511c2f P0011_72efb935 P0010_924e574e 
+uv run python dataset_downloader_base_main.py -c Hot3DAssets_download_urls.json -o ../dataset --sequence_name all
+uv run python dataset_downloader_base_main.py -c Hot3DAria_download_urls.json -o ../dataset --data_types all --sequence_name P0001_a68492d5 P0001_9b6feab7 P0014_8254f925 P0011_76ea6d47 P0014_84ea2dcc P0001_8d136980 P0012_476bae57 P0012_130a66e1 P0014_24cb3bf0 P0010_1c9fe708 P0002_2ea9af5b P0011_11475e24 P0010_0ecbf39f P0010_160e551c P0015_42b8b389 P0012_915e71c6 P0002_65085bfc P0011_47878e48 P0011_cee8fe4f P0002_016222d1 P0012_d85e10f6 P0012_119de519 P0010_41c4c626 P0012_f7e3880b P0009_02511c2f P0011_72efb935 P0010_924e574e 
 ```
 
 *: Downloading and processing code under `hot3d/` is adapted from [Official HOT3D Toolkit](https://github.com/facebookresearch/hot3d).
@@ -251,7 +236,7 @@ mv hot3d_dataset_export ../datasets/hot3d_valset_export
 
 ### Preprocess
 ```
-python lib/datasets/hot3d_dataset_preprocess.py --video_root datasets/hot3d_valset_export --set_file val.json --for_eval
+uv run python lib/datasets/hot3d_dataset_preprocess.py --video_root datasets/hot3d_valset_export --set_file val.json --for_eval
 ```
 
 ### Eval
@@ -259,20 +244,20 @@ python lib/datasets/hot3d_dataset_preprocess.py --video_root datasets/hot3d_vals
 Run hand motion estimation:
 
 ```
-python scripts/scripts_eval/eval_hawor_hot3d.py --inference_stage --gen_hand_mask
+uv run python scripts/scripts_eval/eval_hawor_hot3d.py --inference_stage --gen_hand_mask
 ```
 
 Then run SLAM stage:
 
 ```
-python scripts/scripts_eval/test_mdslam_hot3d.py
+uv run python scripts/scripts_eval/test_mdslam_hot3d.py
 
 ```
 
 Evaluation:
 
 ```
-python scripts/scripts_eval/eval_hawor_hot3d.py --eval_stage
+uv run python scripts/scripts_eval/eval_hawor_hot3d.py --eval_stage
 ```
 
 ## Evaluation on DexYCB
