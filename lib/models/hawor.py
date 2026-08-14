@@ -18,6 +18,7 @@ from hawor.utils.rotation import angle_axis_to_rotation_matrix
 from torch.utils.data import default_collate
 
 from .backbones import create_backbone
+from .losses import Keypoint2DLoss, Keypoint3DLoss, ParameterLoss
 from .mano_wrapper import MANO
 
 
@@ -46,6 +47,7 @@ class HAWOR(pl.LightningModule):
 
         # Create backbone feature extractor
         self.backbone = create_backbone(cfg)
+        self.backbone_frozen = False
         try:
             if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
                 whole_state_dict = torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict']
@@ -55,8 +57,11 @@ class HAWOR(pl.LightningModule):
                         backbone_state_dict[key[9:]] = whole_state_dict[key]
                 self.backbone.load_state_dict(backbone_state_dict)
                 print(f'Loaded backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
-                for param in self.backbone.parameters():
-                    param.requires_grad = False
+                if cfg.MODEL.BACKBONE.get('FREEZE', True):
+                    for param in self.backbone.parameters():
+                        param.requires_grad = False
+                    self.backbone_frozen = True
+                    print('Backbone is frozen.')
             else:
                 print('WARNING: init backbone from sratch !!!')
         except:
@@ -101,9 +106,9 @@ class HAWOR(pl.LightningModule):
             self.mano_head = torch.compile(self.mano_head)
 
         # Define loss functions
-        # self.keypoint_3d_loss = Keypoint3DLoss(loss_type='l1')
-        # self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1')
-        # self.mano_parameter_loss = ParameterLoss()
+        self.keypoint_3d_loss = Keypoint3DLoss(loss_type='l1')
+        self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1')
+        self.mano_parameter_loss = ParameterLoss()
 
         # Instantiate MANO model
         mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
@@ -119,6 +124,17 @@ class HAWOR(pl.LightningModule):
             whole_state_dict = torch.load(cfg.MODEL.LOAD_WEIGHTS, map_location='cpu')['state_dict']
             self.load_state_dict(whole_state_dict, strict=True)
             print(f"load {cfg.MODEL.LOAD_WEIGHTS}")
+
+    def train(self, mode: bool = True):
+        """
+        Keep a frozen backbone in eval mode. The ViT is built with
+        drop_path_rate=0.55, so leaving it in train mode would randomize the
+        features of a backbone that is not being updated.
+        """
+        super().train(mode)
+        if mode and getattr(self, 'backbone_frozen', False):
+            self.backbone.eval()
+        return self
 
     def get_parameters(self):
         all_params = list(self.mano_head.parameters())
@@ -248,7 +264,13 @@ class HAWOR(pl.LightningModule):
 
         # Get annotations
         gt_keypoints_2d = batch['gt_cam_j2d'].flatten(0, 1)
-        gt_keypoints_2d = torch.cat([gt_keypoints_2d, torch.ones(*gt_keypoints_2d.shape[:-1], 1, device=gt_keypoints_2d.device)], dim=-1)
+        # Per-joint 2D confidence, so that joints projecting outside the image do
+        # not contribute. Falls back to all-visible when the dataset omits it.
+        if 'gt_cam_j2d_conf' in batch:
+            gt_conf_2d = batch['gt_cam_j2d_conf'].flatten(0, 1).unsqueeze(-1)
+        else:
+            gt_conf_2d = torch.ones(*gt_keypoints_2d.shape[:-1], 1, device=gt_keypoints_2d.device)
+        gt_keypoints_2d = torch.cat([gt_keypoints_2d, gt_conf_2d], dim=-1)
         gt_keypoints_3d = batch['gt_j3d_wo_trans'].flatten(0, 1)
         gt_keypoints_3d = torch.cat([gt_keypoints_3d, torch.ones(*gt_keypoints_3d.shape[:-1], 1, device=gt_keypoints_3d.device)], dim=-1)
         pose_gt = batch['gt_cam_full_pose'].flatten(0, 1).reshape(-1, 16, 3)

@@ -28,7 +28,45 @@ git clone --recursive https://github.com/ThunderVVV/HaWoR.git
 cd HaWoR
 ```
 
-The code has been tested with PyTorch 1.13 and CUDA 11.7. Higher torch and cuda versions should be also compatible. It is suggested to use an anaconda environment to install the the required dependencies:
+The Python environment is managed with [uv](https://docs.astral.sh/uv/). `pyproject.toml`
+pins Python 3.10 (chumpy, needed by smplx to unpickle the MANO models, calls the
+`inspect.getargspec` that was removed in 3.11) and installs CUDA 12.8 torch wheels.
+
+```bash
+uv sync
+```
+
+That gives you everything needed to preprocess ground truth and train. Prefix commands
+with `uv run` (e.g. `uv run python train.py ...`), or activate `.venv` directly.
+
+Optional extras, installed on demand:
+
+```bash
+uv sync --extra demo    # detection, tracking and rendering for demo.py
+uv sync --extra slam    # masked DROID-SLAM + Metric3D scale estimation
+uv sync --extra hot3d   # HOT3D download/export toolkit
+```
+
+Two packages are deliberately kept out of the lockfile because they compile
+extensions against the already-installed torch, which cannot be resolved from an
+sdist. Neither is needed for training — install them only if you want the demo or
+the SLAM stage:
+
+```bash
+uv pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+```
+
+```bash
+uv pip install --no-build-isolation torch-scatter==2.1.2
+```
+
+<details>
+<summary>Original conda instructions (PyTorch 1.13 / CUDA 11.7)</summary>
+
+Note that torch 1.13+cu117 predates Blackwell (sm_120) GPUs and will fail there with
+"no kernel image is available for execution on the device"; the uv setup above installs
+cu128 wheels instead.
+
 ```bash
 conda create --name hawor python=3.10
 conda activate hawor
@@ -39,6 +77,7 @@ pip install -r requirements.txt
 pip install pytorch-lightning==2.2.4 --no-deps
 pip install lightning-utilities torchmetrics==1.4.0
 ```
+</details>
 
 ### Install masked DROID-SLAM:
 
@@ -78,7 +117,53 @@ python demo.py --video_path ./example/video_0.mp4 --vis_mode cam
 ```
 
 ## Training
-The training code will be released soon. 
+
+This trains the **camera-space hand motion estimator** only. The SLAM stage uses
+frozen off-the-shelf weights (DROID-SLAM + Metric3D) and the motion infiller is a
+separate model.
+
+### 1. Prepare the sequences
+
+Export and preprocess sequences exactly as for evaluation (see *Evaluation on HOT3D*),
+then split the sequence names into `train.json` / `val.json` under the export root.
+
+### 2. Extract the ground truth
+
+```bash
+uv run python lib/datasets/hawor_preprocess_train.py --video_root datasets/hot3d_trainset_export --set_file train.json
+```
+
+This writes one `train_anno.npz` per sequence containing, for each hand and frame:
+GT boxes, 2D joints with per-joint visibility, root-relative 3D joints, camera-space
+axis-angle pose and betas. Repeat with `--set_file val.json`.
+
+### 3. Train
+
+```bash
+uv run python train.py --cfg hawor/configs/hawor_train.yaml --video_root datasets/hot3d_trainset_export
+```
+
+Each sample is a contiguous 16-frame window of a single hand, which is what the
+space-time and motion modules expect. Notes on the setup:
+
+- The network is right-hand only. Left hands are mirrored into right-hand space by
+  the dataset and trained as ordinary right hands; the `do_flip` path in
+  `HAWOR.forward_step` is inference-only.
+- Augmentation (scale, translation, colour) is sampled **once per window**, not per
+  frame, so the temporal modules do not learn to undo synthetic jitter.
+- In-plane rotation and horizontal flip augmentation are rejected by the dataset:
+  rotation breaks the CLIFF bbox feature and the full-frame projection, and flipping
+  a handed model is a no-op here.
+- Losses reduce with `sum()` (HaMeR convention), so their magnitude scales with
+  `BATCH_SIZE * 16`. Re-tune `LOSS_WEIGHTS` if you change the batch size a lot.
+- Use `bf16-mixed`. `16-mixed` inserts a gradient scaler, which breaks the manual
+  `clip_grad_norm_(..., error_if_nonfinite=True)` in `training_step`; `train.py`
+  refuses that combination.
+
+By default the ViT-H backbone is loaded from a pretrained checkpoint and frozen
+(and kept in `eval()` mode, since it is built with `drop_path_rate=0.55`). To
+fine-tune end-to-end afterwards, set `MODEL.BACKBONE.FREEZE: False` and drop
+`TRAIN.LR` to ~1e-5.
 
 ## Evaluation on HOT3D
 

@@ -1,0 +1,81 @@
+GENERAL:
+  NUM_WORKERS: 8
+  PIN_MEMORY: True
+  LOG_STEPS: 100
+  CHECKPOINT_STEPS: 5000
+  VAL_CHECK_INTERVAL: 0.25
+  SANITY_VAL_STEPS: 1
+  SEED: 42
+
+TRAIN:
+  NUM_EPOCHS: 100
+  # Chunks of 16 frames; the effective crop batch is BATCH_SIZE * 16.
+  BATCH_SIZE: 8
+  SHUFFLE: True
+  LR: 1.0e-4
+  WEIGHT_DECAY: 1.0e-4
+  GRAD_CLIP_VAL: 1.0
+  # bf16 has no gradient scaler, so the manual clip_grad_norm_ in training_step
+  # sees unscaled gradients. Do not switch to '16-mixed' while GRAD_CLIP_VAL > 0.
+  PRECISION: bf16-mixed
+  CHUNK_STRIDE: 8
+  VAL_CHUNK_STRIDE: 64
+  RENDER_LOG: True
+
+MODEL:
+  # Must be 256: the ViT takes a 256x192 centre slice of the crop and the 2D loss
+  # is normalized by this value.
+  IMAGE_SIZE: 256
+  BACKBONE:
+    TYPE: vit
+    # Any checkpoint whose state_dict carries 'backbone.*' keys. The released
+    # HaWoR checkpoint is the one the README already has you download, so it is
+    # the default; for a genuine from-scratch reproduction point this at the
+    # WiLoR (or HaMeR) ViT-H instead, since initializing from hawor.ckpt means
+    # starting from an already-trained backbone.
+    PRETRAINED_WEIGHTS: ./weights/hawor/checkpoints/hawor.ckpt
+    FREEZE: True
+    TORCH_COMPILE: 0
+  # Uncomment to warm-start the whole model (backbone + heads) instead of just
+  # the backbone, e.g. when fine-tuning the released checkpoint on new data.
+  # LOAD_WEIGHTS: ./weights/hawor/checkpoints/hawor.ckpt
+  # Free to choose when training from scratch. If you set LOAD_WEIGHTS above,
+  # copy these four values from weights/hawor/model_config.yaml or the
+  # state_dict will not match.
+  ST_MODULE: True
+  ST_HDIM: 512
+  ST_NLAYER: 6
+  MOTION_MODULE: True
+  MOTION_HDIM: 384
+  MOTION_NLAYER: 6
+
+MANO:
+  DATA_DIR: data/
+  MODEL_PATH: data/mano
+  GENDER: neutral
+  NUM_HAND_JOINTS: 15
+  MEAN_PARAMS: data/mano_mean_params.npz
+  CREATE_BODY_POSE: False
+
+# Calibrated for the sum-reduction losses in lib/models/losses.py, so their
+# magnitude scales with BATCH_SIZE * 16. Re-tune if you change the batch size a lot.
+LOSS_WEIGHTS:
+  KEYPOINTS_2D: 0.01
+  KEYPOINTS_3D: 0.05
+  GLOBAL_ORIENT: 0.001
+  HAND_POSE: 0.001
+  BETAS: 0.0005
+
+DATASETS:
+  CONFIG:
+    SCALE_FACTOR: 0.3
+    TRANS_FACTOR: 0.02
+    TRANS_AUG_RATE: 0.5
+    COLOR_SCALE: 0.2
+    BOX_DILATE: 1.2
+    # Both must stay off for this model -- see lib/datasets/hawor_train_dataset.py.
+    # yacs type-checks against the defaults in hawor/configs/__init__.py, where
+    # ROT_FACTOR is an int (30) and ROT_AUG_RATE a float (0.6). Keep the types.
+    ROT_FACTOR: 0
+    ROT_AUG_RATE: 0.0
+    DO_FLIP: False
