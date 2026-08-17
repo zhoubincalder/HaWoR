@@ -19,7 +19,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import ConcatDataset, DataLoader, default_collate
 
 from hawor.configs import get_config
 from lib.datasets.hawor_train_dataset import HaworChunkDataset
@@ -35,8 +35,11 @@ def train_collate(items):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='hawor/configs/hawor_train.yaml')
-    parser.add_argument('--video_root', type=str, required=True,
-                        help='Root of the exported sequences')
+    parser.add_argument('--video_root', type=str, required=True, nargs='+',
+                        help='One or more roots of exported sequences. Multiple roots are '
+                             'concatenated, which is how the released recipe combined '
+                             'HOT3D/ARCTIC/DexYCB/HO3D. Each root needs its own '
+                             'train/val manifest.')
     parser.add_argument('--train_set_file', type=str, default='train.json')
     parser.add_argument('--val_set_file', type=str, default='val.json')
     parser.add_argument('--exp_name', type=str, default='hawor')
@@ -73,12 +76,28 @@ def main():
 
     pl.seed_everything(cfg.GENERAL.get('SEED', 42), workers=True)
 
-    train_dataset = HaworChunkDataset(
-        args.video_root, args.train_set_file, cfg,
-        seq_len=16, stride=cfg.TRAIN.get('CHUNK_STRIDE', 8), train=True)
-    val_dataset = HaworChunkDataset(
-        args.video_root, args.val_set_file, cfg,
-        seq_len=16, stride=cfg.TRAIN.get('VAL_CHUNK_STRIDE', 64), train=False)
+    def build(set_file, stride, train):
+        parts = []
+        for root in args.video_root:
+            ds = HaworChunkDataset(root, set_file, cfg, seq_len=16, stride=stride, train=train)
+            if len(ds) == 0:
+                print(f'WARNING: {root} contributed 0 windows for {set_file}')
+                continue
+            parts.append(ds)
+        if not parts:
+            raise SystemExit(f'No windows found for {set_file} in any of {args.video_root}')
+        if len(parts) == 1:
+            return parts[0]
+        # ConcatDataset samples in proportion to each dataset's size. The released
+        # config gave every dataset WEIGHT 1.0; matching that exactly would need a
+        # weighted sampler, so the effective mix here is size-proportional.
+        total = sum(len(p) for p in parts)
+        for root, p in zip(args.video_root, parts):
+            print(f'  {root}: {len(p)} windows ({100*len(p)/total:.1f}%)')
+        return ConcatDataset(parts)
+
+    train_dataset = build(args.train_set_file, cfg.TRAIN.get('CHUNK_STRIDE', 8), True)
+    val_dataset = build(args.val_set_file, cfg.TRAIN.get('VAL_CHUNK_STRIDE', 64), False)
 
     train_loader = DataLoader(
         train_dataset,
