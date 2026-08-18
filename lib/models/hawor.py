@@ -489,6 +489,9 @@ class HAWOR(pl.LightningModule):
         output = self.forward_step(batch, train=False)
         loss = self.compute_loss(batch, output, train=False)
         output['loss'] = loss
+        # Logged so ModelCheckpoint(monitor='val_loss') can select the best model.
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True,
+                 sync_dist=True, batch_size=batch['img'].shape[0])
         self.tensorboard_logging(batch, output, self.global_step, train=False)
 
         return output

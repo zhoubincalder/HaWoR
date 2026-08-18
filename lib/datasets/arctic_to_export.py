@@ -44,12 +44,30 @@ import numpy as np
 import torch
 
 EGO_VIEW = '0'
+_MEAN_CACHE = {}
 EGO_IMAGE_SCALE = 0.3
 
 # load_gt_cam() computes head_pose @ ego_extrinsics @ R_90. ARCTIC frames are
 # already upright, so the pose is pre-multiplied by R_90's inverse to cancel it.
 R_90 = np.array([[0, 1, 0, 0], [-1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
 
+
+def mano_hands_mean(side):
+    """MANO's mean finger pose (45,), cached per process.
+
+    ARCTIC builds its MANO layer with flat_hand_mean=False and calls it with
+    pose2rot=True, so smplx adds this mean to the stored `pose` internally. HaWoR's
+    run_mano passes rotation matrices (pose2rot=False), which skips that addition,
+    so the mean has to be folded in here. Omitting it displaces vertices by up to
+    ~75mm (right) / ~98mm (left).
+    """
+    if side not in _MEAN_CACHE:
+        pkl = ('_DATA/data/mano/MANO_RIGHT.pkl' if side == 'right'
+               else '_DATA/data_left/mano_left/MANO_LEFT.pkl')
+        with open(pkl, 'rb') as f:
+            d = pickle.load(f, encoding='latin1')
+        _MEAN_CACHE[side] = np.array(d['hands_mean'], dtype=np.float32).reshape(45)
+    return _MEAN_CACHE[side]
 
 def list_sequences(arctic_root):
     """Sequences that have both raw annotations and a cropped-image archive."""
@@ -131,7 +149,8 @@ def convert_sequence(arctic_root, sid, seq, zip_path, out_dir, ioi_offset):
             for side, suffix in (('left', 'l'), ('right', 'r')):
                 m = mano[side]
                 anno[f'rot_{suffix}'][i] = m['rot'][t]
-                anno[f'pose_{suffix}'][i] = m['pose'][t]
+                # ARCTIC's pose is an offset from MANO's hands_mean; see mano_hands_mean().
+                anno[f'pose_{suffix}'][i] = m['pose'][t] + mano_hands_mean(side)
                 anno[f'trans_{suffix}'][i] = m['trans'][t]
                 anno[f'betas_{suffix}'][i] = np.asarray(m['shape'], dtype=np.float32)
 

@@ -130,6 +130,15 @@ def main():
     logger = TensorBoardLogger(save_dir=args.out_dir, name=args.exp_name,
                                default_hp_metric=False)
     callbacks = [
+        # Keep the best-by-val checkpoint as well as periodic snapshots. Without a
+        # monitor, picking the best model means re-evaluating every snapshot after
+        # the fact -- and the training-time val curve is too noisy to choose from
+        # unless limit_val_batches covers most of the val set.
+        ModelCheckpoint(
+            dirpath=os.path.join(log_dir, 'checkpoints'),
+            filename='best-{epoch}-{step}-{val_loss:.4f}',
+            monitor='val_loss', mode='min', save_top_k=3,
+        ),
         ModelCheckpoint(
             dirpath=os.path.join(log_dir, 'checkpoints'),
             filename='{epoch}-{step}',
