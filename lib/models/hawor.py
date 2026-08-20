@@ -62,6 +62,11 @@ class HAWOR(pl.LightningModule):
         # NOTE: failures here are raised, not swallowed. Silently falling back to
         # a randomly initialized ViT-H when a checkpoint was requested is almost
         # never what the caller wants, and it is invisible in the loss curve.
+        # A backbone may arrive pretrained one of two ways: a HaWoR-format
+        # checkpoint with "backbone.*" keys, or (e.g. Sapiens2) weights the
+        # backbone loads itself and which it knows how to freeze selectively.
+        self_pretrained = hasattr(self.backbone, 'freeze_pretrained')
+        has_weights = self_pretrained
         if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
             whole_state_dict = load_checkpoint(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS)['state_dict']
             backbone_state_dict = {}
@@ -73,13 +78,24 @@ class HAWOR(pl.LightningModule):
                     f'{cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS} contains no "backbone.*" keys.')
             self.backbone.load_state_dict(backbone_state_dict)
             print(f'Loaded backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
-            if cfg.MODEL.BACKBONE.get('FREEZE', True):
-                for param in self.backbone.parameters():
-                    param.requires_grad = False
-                self.backbone_frozen = True
-                print('Backbone is frozen.')
+            has_weights = True
+        elif self_pretrained:
+            print(f'Backbone {cfg.MODEL.BACKBONE.TYPE} loaded its own pretrained weights')
         else:
             print('WARNING: init backbone from sratch !!!')
+
+        if has_weights and cfg.MODEL.BACKBONE.get('FREEZE', True):
+            if self_pretrained:
+                # Freezes the pretrained trunk only; any adapter stays trainable.
+                self.backbone.freeze_pretrained()
+            else:
+                for param in self.backbone.parameters():
+                    param.requires_grad = False
+            self.backbone_frozen = True
+            print('Backbone is frozen.')
+
+        if cfg.MODEL.BACKBONE.get('FP8', False):
+            self._quantize_backbone_fp8()
 
         # Space-time memory
         if cfg.MODEL.ST_MODULE: 
@@ -149,8 +165,32 @@ class HAWOR(pl.LightningModule):
         """
         super().train(mode)
         if mode and getattr(self, 'backbone_frozen', False):
-            self.backbone.eval()
+            # A self-pretrained backbone puts only its frozen trunk in eval,
+            # keeping any trainable adapter in train mode.
+            if not hasattr(self.backbone, 'freeze_pretrained'):
+                self.backbone.eval()
         return self
+
+    def _quantize_backbone_fp8(self):
+        """Quantize the frozen trunk to fp8 (weights + dynamic activations).
+
+        Only valid for a frozen backbone: quantized weights are not trainable.
+        Requires an fp8-capable GPU (sm_89+); skipped with a warning otherwise.
+        """
+        trunk = getattr(self.backbone, 'backbone', self.backbone)
+        if not getattr(self, 'backbone_frozen', False):
+            print('WARNING: FP8 requested but backbone is not frozen; skipping.')
+            return
+        major, _ = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+        if major < 9 and not (major == 8):
+            print(f'WARNING: FP8 needs sm_89+; device is sm_{major}x. Skipping.')
+            return
+        try:
+            from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+            quantize_(trunk, Float8DynamicActivationFloat8WeightConfig())
+            print('Backbone quantized to fp8 (dynamic act + fp8 weights).')
+        except Exception as e:
+            print(f'WARNING: fp8 quantization failed ({type(e).__name__}: {e}); staying in bf16.')
 
     def get_parameters(self):
         all_params = list(self.mano_head.parameters())
@@ -195,7 +235,11 @@ class HAWOR(pl.LightningModule):
         bbox_info = self.bbox_est(center, scale, img_focal, img_center)
 
         # backbone
-        feature = self.backbone(image[:,:,:,32:-32])
+        # The crop is square; the backbone takes a 4:3 centre slice of it
+        # (256 -> 256x192, 1024 -> 1024x768). Scaling with crop_size keeps the
+        # aspect ratio fixed when a backbone wants its native resolution.
+        side_crop = self.crop_size // 8
+        feature = self.backbone(image[:, :, :, side_crop:-side_crop])
         feature = feature.float()
 
         # space-time module
