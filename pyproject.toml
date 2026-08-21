@@ -33,6 +33,7 @@ dependencies = [
     "natsort",
     "transformers>=5.15.0",
     "torchao>=0.18.0",
+    "peft>=0.20.0",
 ]
 
 [project.optional-dependencies]

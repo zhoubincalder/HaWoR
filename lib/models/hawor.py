@@ -94,7 +94,24 @@ class HAWOR(pl.LightningModule):
             self.backbone_frozen = True
             print('Backbone is frozen.')
 
-        if cfg.MODEL.BACKBONE.get('FP8', False):
+        # LoRA: adapters on a frozen trunk. Must come after freezing so the base
+        # stays fixed, and it rules out fp8 -- gradients have to flow through the
+        # trunk, which torchao's quantized weights are not set up for.
+        if cfg.MODEL.BACKBONE.get('LORA', False):
+            if not self.backbone_frozen:
+                raise ValueError('MODEL.BACKBONE.LORA requires FREEZE: True '
+                                 '(LoRA adapts a frozen trunk).')
+            if not hasattr(self.backbone, 'enable_lora'):
+                raise ValueError(f'backbone {cfg.MODEL.BACKBONE.TYPE} does not support LoRA.')
+            self.backbone.enable_lora(
+                r=cfg.MODEL.BACKBONE.get('LORA_R', 16),
+                alpha=cfg.MODEL.BACKBONE.get('LORA_ALPHA', 32),
+                dropout=cfg.MODEL.BACKBONE.get('LORA_DROPOUT', 0.05),
+                targets=cfg.MODEL.BACKBONE.get('LORA_TARGETS', None),
+                grad_checkpoint=cfg.MODEL.BACKBONE.get('GRAD_CHECKPOINT', True))
+            if cfg.MODEL.BACKBONE.get('FP8', False):
+                print('NOTE: FP8 skipped because LoRA needs gradients through the trunk.')
+        elif cfg.MODEL.BACKBONE.get('FP8', False):
             self._quantize_backbone_fp8()
 
         # Space-time memory

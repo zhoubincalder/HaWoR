@@ -72,13 +72,16 @@ class HaworChunkDataset(Dataset):
         # and the full-frame projection in HAWOR.project both assume an
         # axis-aligned crop, so rotating it would desynchronize the 2D loss from
         # the predicted camera translation.
-        if aug.get('ROT_AUG_RATE', 0) > 0 and aug.get('ROT_FACTOR', 0) > 0:
+        # Only an issue when augmentation is actually applied; eval mode never
+        # augments, so a config carrying rotation aug (the released one does)
+        # must still be usable for evaluation.
+        if train and aug.get('ROT_AUG_RATE', 0) > 0 and aug.get('ROT_FACTOR', 0) > 0:
             raise ValueError(
                 'ROT_AUG_RATE must be 0 for HaWoR: in-plane crop rotation is '
                 'inconsistent with the CLIFF bbox feature and full-frame projection.')
         # Horizontal flip is a no-op for a handed model: flipping a right hand
         # produces a left hand, which this dataset would mirror straight back.
-        if aug.get('DO_FLIP', False):
+        if train and aug.get('DO_FLIP', False):
             raise ValueError('DO_FLIP must be False: left hands are already mirrored '
                              'into right-hand space by this dataset.')
 

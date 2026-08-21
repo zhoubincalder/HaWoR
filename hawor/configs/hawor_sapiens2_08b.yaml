@@ -1,0 +1,98 @@
+GENERAL:
+  NUM_WORKERS: 8
+  PIN_MEMORY: True
+  LOG_STEPS: 100
+  CHECKPOINT_STEPS: 5000
+  VAL_CHECK_INTERVAL: 0.25
+  SANITY_VAL_STEPS: 1
+  SEED: 42
+
+TRAIN:
+  NUM_EPOCHS: 100
+  # Chunks of 16 frames; the effective crop batch is BATCH_SIZE * 16.
+  BATCH_SIZE: 8
+  SHUFFLE: True
+  # LR, WEIGHT_DECAY, LOSS_REDUCTION and LOSS_WEIGHTS below all match the
+  # released weights/hawor/model_config.yaml. Raise LR to ~1e-4 if you keep the
+  # backbone frozen and want the head phase to converge faster.
+  LR: 1.0e-5
+  WEIGHT_DECAY: 1.0e-4
+  # 'mean' (release default) averages the per-sample loss over the batch;
+  # 'sum' is the HaMeR convention and makes the effective LR scale with B*16.
+  LOSS_REDUCTION: mean
+  GRAD_CLIP_VAL: 1.0
+  # bf16 has no gradient scaler, so the manual clip_grad_norm_ in training_step
+  # sees unscaled gradients. Do not switch to '16-mixed' while GRAD_CLIP_VAL > 0.
+  PRECISION: bf16-mixed
+  CHUNK_STRIDE: 8
+  VAL_CHUNK_STRIDE: 64
+  RENDER_LOG: True
+
+MODEL:
+  # 256 -> the backbone sees a 256x192 centre slice, matching the ViT-H path and
+  # giving the 16x12 grid forward_step expects. Sapiens2 pretrained at 1024x768,
+  # but the input here is an already-cropped hand: source frames are 704px
+  # (HOT3D) / 840x600 (ARCTIC) and a hand box is ~200px, so feeding 1024x768
+  # would upsample ~5x and add no real detail for 16x the tokens.
+  # forward_step's slice and the wrapper's pooling both scale, so raising this
+  # to 512 or 1024 works if you want to test that trade-off.
+  IMAGE_SIZE: 256
+  BACKBONE:
+    TYPE: sapiens2
+    # Any checkpoint whose state_dict carries 'backbone.*' keys. The released
+    # HaWoR checkpoint is the one the README already has you download, so it is
+    # the default; for a genuine from-scratch reproduction point this at the
+    # WiLoR (or HaMeR) ViT-H instead, since initializing from hawor.ckpt means
+    # starting from an already-trained backbone.
+    PRETRAINED_WEIGHTS: ''
+    SAPIENS_DIR: weights/sapiens2_08b
+    SAPIENS_BF16: True
+    FP8: True
+    FREEZE: True
+    TORCH_COMPILE: 1
+  # Uncomment to warm-start the whole model (backbone + heads) instead of just
+  # the backbone, e.g. when fine-tuning the released checkpoint on new data.
+  # LOAD_WEIGHTS: ./weights/hawor/checkpoints/hawor.ckpt
+  # These match the released weights/hawor/model_config.yaml, verified by
+  # loading hawor.ckpt into this config with strict=True. Change them only when
+  # training a new architecture from scratch, not when using LOAD_WEIGHTS.
+  ST_MODULE: True
+  ST_HDIM: 512
+  ST_NLAYER: 6
+  MOTION_MODULE: True
+  MOTION_HDIM: 384
+  MOTION_NLAYER: 6
+
+MANO:
+  DATA_DIR: data/
+  MODEL_PATH: data/mano
+  GENDER: neutral
+  NUM_HAND_JOINTS: 15
+  MEAN_PARAMS: data/mano_mean_params.npz
+  CREATE_BODY_POSE: False
+
+# Verbatim from the released weights/hawor/model_config.yaml. Valid as-is under
+# TRAIN.LOSS_REDUCTION: mean; re-tune if you switch to 'sum'.
+LOSS_WEIGHTS:
+  KEYPOINTS_2D: 0.01
+  KEYPOINTS_3D: 0.05
+  GLOBAL_ORIENT: 0.001
+  HAND_POSE: 0.001
+  BETAS: 0.0005
+
+DATASETS:
+  CONFIG:
+    SCALE_FACTOR: 0.3
+    TRANS_FACTOR: 0.02
+    TRANS_AUG_RATE: 0.5
+    COLOR_SCALE: 0.2
+    BOX_DILATE: 1.2
+    # The released config used ROT_FACTOR 30 / ROT_AUG_RATE 0.6, but this
+    # reimplementation does not support in-plane rotation: it is only exact if
+    # the principal point is moved to the crop centre, which would zero out the
+    # CLIFF bbox feature. See lib/datasets/hawor_train_dataset.py.
+    # yacs type-checks against hawor/configs/__init__.py, where ROT_FACTOR is an
+    # int (30) and ROT_AUG_RATE a float (0.6). Keep the types.
+    ROT_FACTOR: 0
+    ROT_AUG_RATE: 0.0
+    DO_FLIP: False
