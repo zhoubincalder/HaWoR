@@ -131,3 +131,67 @@ class PositionalEncoding(nn.Module):
         # not used in the final model
         x = x + self.pe[:x.shape[0], :]
         return self.dropout(x)
+
+
+class MANOTwoHandHead(nn.Module):
+    """Cross-attention head that reads a full-frame feature grid and emits both
+    hands at once.
+
+    Two learnable query tokens (slot 0 = left, slot 1 = right) attend over the
+    same feature map, so the hands are decoded jointly rather than from separate
+    crops. Each slot also predicts a visibility logit, because on a full frame a
+    hand is frequently absent -- with per-hand crops that case simply never
+    reached the model.
+    """
+
+    def __init__(self, cfg, context_dim=1280, use_init_cam=False):
+        super().__init__()
+        self.use_init_cam = use_init_cam
+        transformer_args = dict(
+            depth=6, heads=8, mlp_dim=1024, dim_head=64,
+            dropout=0.0, emb_dropout=0.0, norm='layer',
+            context_dim=context_dim, num_tokens=2, token_dim=1, dim=1024,
+        )
+        self.transformer = TransformerDecoder(**transformer_args)
+
+        dim, npose = 1024, 16 * 6
+        self.decpose = nn.Linear(dim, npose)
+        self.decshape = nn.Linear(dim, 10)
+        self.deccam = nn.Linear(dim, 3)
+        self.decvis = nn.Linear(dim, 1)
+        for m in (self.decpose, self.decshape, self.deccam, self.decvis):
+            nn.init.xavier_uniform_(m.weight, gain=0.01)
+            nn.init.zeros_(m.bias)
+
+        mean_params = np.load(cfg.MANO.MEAN_PARAMS)
+        self.register_buffer('init_hand_pose',
+                             torch.from_numpy(mean_params['pose'].astype(np.float32)).unsqueeze(0))
+        self.register_buffer('init_betas',
+                             torch.from_numpy(mean_params['shape'].astype('float32')).unsqueeze(0))
+        self.register_buffer('init_cam',
+                             torch.from_numpy(mean_params['cam'].astype(np.float32)).unsqueeze(0))
+
+    def forward(self, x, return_tokens=False):
+        """x: (B, C, H, W) feature grid -> per-hand predictions with a leading
+        (B, 2) layout, slot 0 left / slot 1 right."""
+        b = x.shape[0]
+        ctx = einops.rearrange(x, 'b c h w -> b (h w) c')
+        token = torch.zeros(b, 2, 1, device=x.device, dtype=ctx.dtype)
+        tok = self.transformer(token, context=ctx)          # (B, 2, dim)
+        if return_tokens:
+            return tok
+        return self.decode(tok)
+
+    def decode(self, tok):
+        b = tok.shape[0]
+        flat = tok.reshape(b * 2, -1)
+        pose = self.decpose(flat) + self.init_hand_pose.expand(b * 2, -1)
+        shape = self.decshape(flat) + self.init_betas.expand(b * 2, -1)
+        # The mean init_cam is calibrated for the crop parametrisation (s, tx, ty);
+        # under the full-frame one it would place hands off-image, so it is opt-in.
+        cam = self.deccam(flat)
+        if self.use_init_cam:
+            cam = cam + self.init_cam.expand(b * 2, -1)
+        vis = self.decvis(flat)
+        r = lambda t: t.reshape(b, 2, -1)
+        return r(pose), r(shape), r(cam), r(vis).squeeze(-1)
