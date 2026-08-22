@@ -74,6 +74,27 @@ class HaworFull(pl.LightningModule):
             self.backbone_frozen = True
             print('Backbone is frozen.')
 
+        # LoRA adapters on the frozen trunk, so the backbone's features can adapt
+        # to full frames rather than only the projection reading them. Rules out
+        # fp8: gradients must flow through the trunk, which torchao's quantized
+        # weights are not set up for.
+        if cfg.MODEL.BACKBONE.get('LORA', False):
+            if not self.backbone_frozen:
+                raise ValueError('MODEL.BACKBONE.LORA requires FREEZE: True')
+            if not hasattr(self.backbone, 'enable_lora'):
+                raise ValueError(f'backbone {cfg.MODEL.BACKBONE.TYPE} has no LoRA support')
+            self.backbone.enable_lora(
+                r=cfg.MODEL.BACKBONE.get('LORA_R', 16),
+                alpha=cfg.MODEL.BACKBONE.get('LORA_ALPHA', 32),
+                dropout=cfg.MODEL.BACKBONE.get('LORA_DROPOUT', 0.05),
+                targets=cfg.MODEL.BACKBONE.get('LORA_TARGETS', None),
+                grad_checkpoint=cfg.MODEL.BACKBONE.get('GRAD_CHECKPOINT', True))
+            if cfg.MODEL.BACKBONE.get('FP8', False):
+                print('NOTE: FP8 skipped because LoRA needs gradients through the trunk.')
+        elif cfg.MODEL.BACKBONE.get('FP8', False):
+            from lib.models.hawor import HAWOR
+            HAWOR._quantize_backbone_fp8(self)
+
         self.head = MANOTwoHandHead(cfg, context_dim=1280, use_init_cam=False)
 
         # Temporal attention over each hand's token sequence.
@@ -103,6 +124,23 @@ class HaworFull(pl.LightningModule):
             self.mano_left.shapedirs[:, 0, :] *= -1
 
         self.automatic_optimization = False
+
+        # Warm start from a previous run's weights, tolerating structural
+        # differences. Adding LoRA wraps the backbone with peft, which renames its
+        # keys, so a strict load (or Lightning's --resume) fails -- but the head,
+        # temporal module and projection are unchanged and worth keeping rather
+        # than retraining from scratch.
+        ws = cfg.MODEL.get('WARM_START', None)
+        if ws:
+            sd = load_checkpoint(ws)['state_dict']
+            missing, unexpected = self.load_state_dict(sd, strict=False)
+            loaded = len(sd) - len(unexpected)
+            print(f'Warm start from {ws}: loaded {loaded}/{len(sd)} tensors '
+                  f'({len(missing)} missing, {len(unexpected)} unexpected)')
+            head_missing = [k for k in missing if not k.startswith('backbone.')]
+            if head_missing:
+                print(f'  NOTE {len(head_missing)} non-backbone keys did not load, '
+                      f'e.g. {head_missing[:3]}')
 
     def train(self, mode: bool = True):
         super().train(mode)

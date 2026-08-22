@@ -54,6 +54,11 @@ def evaluate(ckpt, batch_size, workers):
     cfg = get_config(os.path.join(d, 'model_config.yaml'), merge=True, update_cachedir=False)
     cfg.defrost()
     cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS = ''
+    # Evaluate in plain precision. If the model is built with fp8, its weights are
+    # torchao quantized subclasses and copying a plain checkpoint tensor into one
+    # fails with "'Tensor' object has no attribute 'qdata'". Weights come from the
+    # checkpoint anyway, so quantization only affects speed here.
+    cfg.MODEL.BACKBONE.FP8 = False
     cfg.freeze()
 
     model = HaworFull(cfg).cuda().eval()
