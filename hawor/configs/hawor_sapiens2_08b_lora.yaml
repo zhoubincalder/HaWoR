@@ -39,6 +39,8 @@ MODEL:
   IMAGE_SIZE: 256
   BACKBONE:
     TYPE: sapiens2
+    # crop model's ST module rearranges with a hardcoded 16x12 grid
+    POOL_GRID: [16, 12]
     # Any checkpoint whose state_dict carries 'backbone.*' keys. The released
     # HaWoR checkpoint is the one the README already has you download, so it is
     # the default; for a genuine from-scratch reproduction point this at the

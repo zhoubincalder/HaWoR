@@ -74,6 +74,14 @@ class HaworFull(pl.LightningModule):
             self.backbone_frozen = True
             print('Backbone is frozen.')
 
+        # A full fine-tune (FREEZE: False) must recompute activations or it OOMs;
+        # enable_lora() handles its own case.
+        if (cfg.MODEL.BACKBONE.get('GRAD_CHECKPOINT', True)
+                and not cfg.MODEL.BACKBONE.get('LORA', False)
+                and not self.backbone_frozen
+                and hasattr(self.backbone, 'enable_grad_checkpoint')):
+            self.backbone.enable_grad_checkpoint()
+
         # LoRA adapters on the frozen trunk, so the backbone's features can adapt
         # to full frames rather than only the projection reading them. Rules out
         # fp8: gradients must flow through the trunk, which torchao's quantized

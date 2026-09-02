@@ -27,6 +27,16 @@ class Sapiens2Wrapper(nn.Module):
         model_dir = cfg.MODEL.BACKBONE.get('SAPIENS_DIR', 'weights/sapiens2')
         dtype = torch.bfloat16 if cfg.MODEL.BACKBONE.get('SAPIENS_BF16', True) else torch.float32
         self.backbone = Sapiens2Backbone.from_pretrained(model_dir, dtype=dtype)
+        # from_pretrained() returns the trunk in eval mode. nn.Module's default is
+        # train mode, so leaving it as-is makes the trunk disagree with its parent
+        # for any run where nobody calls .train() -- and Lightning does not call it
+        # before the first training batch. That silently disables gradient
+        # checkpointing, because transformers guards recomputation on
+        # `self.gradient_checkpointing and self.training`: the flag was set, the
+        # trunk was in eval, and zero blocks were ever recomputed. Cost was ~6x
+        # peak memory (44.4 GB vs 10.8 GB at 384x512), which is what forced the
+        # small batch sizes in the LoRA runs. freeze_pretrained() re-evals it.
+        self.backbone.train()
         hidden = getattr(self.backbone.config, 'hidden_size', SAPIENS_HIDDEN)
         # Trainable: this is part of the head, not the frozen feature extractor.
         self.proj = nn.Conv2d(hidden, HAWOR_HIDDEN, kernel_size=1)
@@ -34,12 +44,32 @@ class Sapiens2Wrapper(nn.Module):
         nn.init.zeros_(self.proj.bias)
         self._frozen = False
         self._lora = False
+        pg = cfg.MODEL.BACKBONE.get('POOL_GRID', None)
+        self.pool_grid = tuple(pg) if pg else None
+        if self.pool_grid:
+            print(f'Backbone features pooled to {self.pool_grid[0]}x{self.pool_grid[1]}.')
+
+    def enable_grad_checkpoint(self):
+        """Recompute activations in the backward pass instead of storing them.
+
+        Required for any configuration that backpropagates through the trunk --
+        full fine-tuning at 768x1024 needs ~15GB with this on and OOMs above
+        99GB with it off. enable_lora() turns it on itself; a full fine-tune
+        (FREEZE: False) has to ask for it.
+        """
+        self.backbone.gradient_checkpointing_enable()
+        if hasattr(self.backbone, 'enable_input_require_grads'):
+            self.backbone.enable_input_require_grads()
+        print('Backbone gradient checkpointing enabled.')
 
     def freeze_pretrained(self):
         """Freeze Sapiens2 itself, leaving the projection trainable."""
         for p in self.backbone.parameters():
             p.requires_grad = False
         self._frozen = True
+        # train() re-applies this, but set it here too: nothing guarantees train()
+        # is ever called (see __init__), and a frozen trunk belongs in eval.
+        self.backbone.eval()
 
     def enable_lora(self, r=16, alpha=32, dropout=0.05, targets=None,
                     grad_checkpoint=True):
@@ -88,12 +118,14 @@ class Sapiens2Wrapper(nn.Module):
         else:
             feats = self.backbone(x.to(dtype)).feature_maps[-1]
         feats = self.proj(feats.to(self.proj.weight.dtype))
-        # At Sapiens2's native 1024x768 the grid is 64x48; HAWOR.forward_step
-        # rearranges assuming 16x12, and running the space-time attention over
-        # 3072 spatial locations would be intractable anyway. Pool back to 16x12
-        # so the rest of the network is identical to the ViT-H path.
-        if feats.shape[-2:] != (GRID_H, GRID_W):
-            feats = nn.functional.adaptive_avg_pool2d(feats, (GRID_H, GRID_W))
+        # Pool only when asked. The crop model's space-time module rearranges with
+        # a hardcoded 16x12 grid, so that path needs POOL_GRID; the full-frame
+        # model's head flattens the grid into a cross-attention context and works
+        # at any size, so it keeps the backbone's native resolution -- at
+        # 768x1024 that is 48x64 instead of 16x12, a 16x finer spatial grid, and
+        # nearly free because only two query tokens attend over it.
+        if self.pool_grid is not None and tuple(feats.shape[-2:]) != self.pool_grid:
+            feats = nn.functional.adaptive_avg_pool2d(feats, self.pool_grid)
         return feats
 
 

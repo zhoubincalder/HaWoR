@@ -10,13 +10,17 @@ GENERAL:
 TRAIN:
   NUM_EPOCHS: 100
   # Chunks of 16 frames; the effective crop batch is BATCH_SIZE * 16.
-  BATCH_SIZE: 8
+  # 4 -> 45.6 GB peak. Throughput is flat in batch size at this resolution, so a
+  # larger batch costs no wall-clock and only improves the gradient estimate;
+  # 8 would need ~85 GB and would not fit an 80 GB H100.
+  BATCH_SIZE: 4
   SHUFFLE: True
   # LR, WEIGHT_DECAY, LOSS_REDUCTION and LOSS_WEIGHTS below all match the
   # released weights/hawor/model_config.yaml. Raise LR to ~1e-4 if you keep the
   # backbone frozen and want the head phase to converge faster.
   LR: 1.0e-5
   WEIGHT_DECAY: 1.0e-4
+  # 15 h/epoch at this resolution, so validate more often than once an epoch.
   # 'mean' (release default) averages the per-sample loss over the batch;
   # 'sum' is the HaMeR convention and makes the effective LR scale with B*16.
   LOSS_REDUCTION: mean
@@ -37,10 +41,18 @@ MODEL:
   # forward_step's slice and the wrapper's pooling both scale, so raising this
   # to 512 or 1024 works if you want to test that trade-off.
   IMAGE_SIZE: 256
+  # Full-frame input, letterboxed, at Sapiens2's native pretraining scale.
+  # Sapiens2's config says 1024x768 as HxW (portrait); HOT3D and ARCTIC frames
+  # are landscape, so this is the transpose -- the same pixel count and patch
+  # grid, which is what RoPE and the patch embedding care about.
+  # The backbone grid is 48x64 = 3072 tokens and is kept at full resolution:
+  # MANOTwoHandHead flattens it into a cross-attention context and has only two
+  # query tokens, so the context length is nearly free. Measured against the
+  # pooled 16x12 grid at 384x512: identical peak memory, 1.7% slower per step.
+  INPUT_H: 768
+  INPUT_W: 1024
   BACKBONE:
     TYPE: sapiens2
-    # crop model's ST module rearranges with a hardcoded 16x12 grid
-    POOL_GRID: [16, 12]
     # Any checkpoint whose state_dict carries 'backbone.*' keys. The released
     # HaWoR checkpoint is the one the README already has you download, so it is
     # the default; for a genuine from-scratch reproduction point this at the
@@ -49,16 +61,28 @@ MODEL:
     PRETRAINED_WEIGHTS: ''
     SAPIENS_DIR: weights/sapiens2_08b
     SAPIENS_BF16: True
-    FP8: True
-    FREEZE: True
-    TORCH_COMPILE: 1
-  # Uncomment to warm-start the whole model (backbone + heads) instead of just
-  # the backbone, e.g. when fine-tuning the released checkpoint on new data.
-  # LOAD_WEIGHTS: ./weights/hawor/checkpoints/hawor.ckpt
+    # Full fine-tune: no freezing, no LoRA. Measured at 45.6 GB peak for
+    # BATCH_SIZE 4 and ~5.6 frames/s, so memory is not the binding constraint --
+    # throughput is, and it is flat across batch size because the GPU is already
+    # saturated at batch 1.
+    FP8: False
+    FREEZE: False
+    LORA: False
+    # Mandatory here. Without recomputation this config needs >99 GB and OOMs;
+    # with it, 15.8 GB at batch 1. Costs ~30% step time.
+    GRAD_CHECKPOINT: True
+    # No POOL_GRID: keep the backbone's native 48x64 grid.
+    TORCH_COMPILE: 0
+  # Warm-start head + motion module from the frozen-backbone full-frame run so
+  # the 3D heads do not have to relearn placement from scratch while the
+  # backbone is also moving. Loaded with strict=False: that checkpoint's
+  # backbone weights are the untouched Sapiens2 pretrained ones (it was frozen),
+  # so this restores heads and backbone in one load.
+  WARM_START: logs/full_sapiens2_08b/checkpoints/last.ckpt
   # These match the released weights/hawor/model_config.yaml, verified by
   # loading hawor.ckpt into this config with strict=True. Change them only when
   # training a new architecture from scratch, not when using LOAD_WEIGHTS.
-  ST_MODULE: True
+  ST_MODULE: False   # full-frame model attends over hand tokens, not grid cells
   ST_HDIM: 512
   ST_NLAYER: 6
   MOTION_MODULE: True
@@ -68,6 +92,7 @@ MODEL:
 MANO:
   DATA_DIR: data/
   MODEL_PATH: data/mano
+  MODEL_PATH_LEFT: _DATA/data_left/mano_left
   GENDER: neutral
   NUM_HAND_JOINTS: 15
   MEAN_PARAMS: data/mano_mean_params.npz
@@ -76,6 +101,7 @@ MANO:
 # Verbatim from the released weights/hawor/model_config.yaml. Valid as-is under
 # TRAIN.LOSS_REDUCTION: mean; re-tune if you switch to 'sum'.
 LOSS_WEIGHTS:
+  VISIBILITY: 0.01
   KEYPOINTS_2D: 0.01
   KEYPOINTS_3D: 0.05
   GLOBAL_ORIENT: 0.001
