@@ -42,6 +42,11 @@ from lib.eval_utils.custom_utils import load_gt_cam
 NUM_JOINTS = 21
 HANDS = ['left', 'right']
 
+# A sequence directory containing this file has left-hand betas fitted against
+# the UNCORRECTED MANO_LEFT shapedirs (manopth's convention -- DexYCB and
+# anything else built on manopth). Written by the converter, read here.
+MANO_LEFT_UNFIXED_MARKER = 'mano_left_unfixed'
+
 
 def load_image_files(video_dir):
     img_folder = os.path.join(video_dir, 'extracted_images')
@@ -51,15 +56,25 @@ def load_image_files(video_dir):
     return imgfiles
 
 
-def run_mano_batched(hand, trans, root_orient, hand_pose, betas, use_cuda=True, chunk=1024):
-    """Run MANO over a long sequence in chunks so we do not blow up GPU memory."""
+def run_mano_batched(hand, trans, root_orient, hand_pose, betas, use_cuda=True,
+                     chunk=1024, fix_shapedirs=True):
+    """Run MANO over a long sequence in chunks so we do not blow up GPU memory.
+
+    fix_shapedirs applies only to the left hand: MANO_LEFT.pkl ships mirrored
+    shapedirs (smplx issue #48) and run_mano_left corrects them by default. A
+    dataset whose left-hand betas were fitted against the UNCORRECTED model --
+    anything built on manopth, DexYCB included -- must be evaluated with the
+    correction off, or its shape is reinterpreted and the joints move ~15mm.
+    See MANO_LEFT_UNFIXED_MARKER.
+    """
     fn = run_mano if hand == 'right' else run_mano_left
+    kw = {} if hand == 'right' else {'fix_shapedirs': fix_shapedirs}
     joints = []
     T = trans.shape[1]
     for s in range(0, T, chunk):
         e = min(T, s + chunk)
         out = fn(trans[:, s:e], root_orient[:, s:e], hand_pose[:, s:e],
-                 betas=betas[:, s:e], use_cuda=use_cuda)
+                 betas=betas[:, s:e], use_cuda=use_cuda, **kw)
         joints.append(out['joints'][0].detach().cpu())
     return torch.cat(joints, dim=0)  # (T, 21, 3)
 
@@ -107,6 +122,9 @@ def process_video(video_root, video, min_vis_joints=12, use_cuda=True, overwrite
                   [0, img_focal, img_center[1]],
                   [0, 0, 1]], dtype=np.float32)
 
+    fix_shapedirs = not os.path.exists(
+        os.path.join(video_dir, MANO_LEFT_UNFIXED_MARKER))
+
     anno = joblib.load(os.path.join(video_dir, 'anno.pth'))
     world_rot = torch.stack([anno['rot_l'], anno['rot_r']]).float()          # (2, T, 3)
     world_trans = torch.stack([anno['trans_l'], anno['trans_r']]).float()    # (2, T, 3)
@@ -138,7 +156,8 @@ def process_video(video_root, video, min_vis_joints=12, use_cuda=True, overwrite
         betas = world_betas[h_idx:h_idx + 1]
 
         # World-space joints -> camera space, used for the 2D reprojection target.
-        world_joints = run_mano_batched(hand, trans, rot, pose, betas, use_cuda=use_cuda)
+        world_joints = run_mano_batched(hand, trans, rot, pose, betas,
+                                        use_cuda=use_cuda, fix_shapedirs=fix_shapedirs)
         cam_j3d = torch.einsum('tij,tnj->tni', R_w2c, world_joints) + t_w2c[:, None, :]
 
         # Camera-space root orientation; finger joint rotations are relative and unchanged.
@@ -155,6 +174,7 @@ def process_video(video_root, video, min_vis_joints=12, use_cuda=True, overwrite
             pose,
             betas,
             use_cuda=use_cuda,
+            fix_shapedirs=fix_shapedirs,
         )
 
         # Project into the full image.

@@ -24,11 +24,20 @@ RealSense cameras, ~1000 sequences. Three things need care.
    frames are translated to put it there. There is no distortion to undo --
    the released colour images are already rectified.
 
-3. Handedness. Every DexYCB subject is right-handed (all ten mano_calib
-   entries are `*_right`) and only one hand is in shot, so the left hand is
-   genuinely absent rather than unlabelled. hawor_preprocess_train derives
-   validity from `any(rot != 0)`, so leaving the left arrays zero marks it
-   not-visible, which is the correct label.
+3. Handedness. Sessions are split 50/50 between left and right hands (200 each
+   over the first four subjects), and `meta.yml: mano_sides` says which -- NOT
+   the mano_calib name. Every calibration directory is named `*_right` because
+   DexYCB fits one shape per subject from the right hand and reuses it for
+   both, so reading handedness off those names gives "all right" and is wrong
+   for half the data.
+
+   Only one hand is ever in shot, so the other is genuinely absent rather than
+   unlabelled; hawor_preprocess_train derives validity from `any(rot != 0)`,
+   so leaving that side's arrays zero is the correct label.
+
+   The PCA basis is side-specific: MANO_LEFT.pkl carries its own hands_mean and
+   hands_components, and using the right basis for a left hand is exactly what
+   the joint check exists to catch.
 
 Every sequence is verified against DexYCB's own `joint_3d` before it is
 written; a mismatch raises rather than emitting quietly wrong data.
@@ -74,20 +83,22 @@ NON_TIP_JOINTS = [i for i in range(21) if i % 4 != 0 or i == 0]
 _MANO_CACHE = {}
 
 
-def mano_pca_basis():
-    """(hands_mean (45,), hands_components (45,45)) from the right MANO pkl."""
-    if 'right' not in _MANO_CACHE:
-        with open('_DATA/data/mano/MANO_RIGHT.pkl', 'rb') as f:
+def mano_pca_basis(side='right'):
+    """(hands_mean (45,), hands_components (45,45)) for one MANO side."""
+    if side not in _MANO_CACHE:
+        pkl = ('_DATA/data/mano/MANO_RIGHT.pkl' if side == 'right'
+               else '_DATA/data_left/mano_left/MANO_LEFT.pkl')
+        with open(pkl, 'rb') as f:
             d = pickle.load(f, encoding='latin1')
-        _MANO_CACHE['right'] = (np.array(d['hands_mean'], dtype=np.float64).reshape(45),
-                                np.array(d['hands_components'], dtype=np.float64)[:45])
-    return _MANO_CACHE['right']
+        _MANO_CACHE[side] = (np.array(d['hands_mean'], dtype=np.float64).reshape(45),
+                             np.array(d['hands_components'], dtype=np.float64)[:45])
+    return _MANO_CACHE[side]
 
 
-def mano_pca_to_axis_angle(pca):
+def mano_pca_to_axis_angle(pca, side='right'):
     """(...,45) PCA coefficients -> (...,45) axis-angle, matching manopth's
     ManoLayer(flat_hand_mean=False, ncomps=45, use_pca=True)."""
-    mean, comps = mano_pca_basis()
+    mean, comps = mano_pca_basis(side)
     return pca @ comps + mean
 
 
@@ -127,8 +138,9 @@ def convert_sequence(seq_dir, calib_root, serial, out_dir, jpeg_q=92, tol_mm=0.0
     if serial not in meta['serials']:
         raise RuntimeError(f'{seq_dir}: camera {serial} not in this sequence')
     side = meta['mano_sides'][0]
-    if side != 'right':
+    if side not in ('left', 'right'):
         raise RuntimeError(f'{seq_dir}: unexpected hand side {side!r}')
+    suf = "l" if side == "left" else "r"
 
     intr = load_yaml(os.path.join(calib_root, 'intrinsics', f'{serial}_640x480.yml'))['color']
     betas = np.asarray(load_yaml(os.path.join(
@@ -167,10 +179,10 @@ def convert_sequence(seq_dir, calib_root, serial, out_dir, jpeg_q=92, tol_mm=0.0
         pm = z['pose_m'][0].astype(np.float64)
         if not np.any(pm):
             continue                       # no hand annotation for this frame
-        anno['rot_r'][t] = pm[0:3]
-        anno['pose_r'][t] = mano_pca_to_axis_angle(pm[3:48])
-        anno['trans_r'][t] = pm[48:51]
-        anno['betas_r'][t] = betas
+        anno[f'rot_{suf}'][t] = pm[0:3]
+        anno[f'pose_{suf}'][t] = mano_pca_to_axis_angle(pm[3:48], side)
+        anno[f'trans_{suf}'][t] = pm[48:51]
+        anno[f'betas_{suf}'][t] = betas
         n_valid += 1
 
         j = z['joint_3d'][0]
@@ -185,13 +197,17 @@ def convert_sequence(seq_dir, calib_root, serial, out_dir, jpeg_q=92, tol_mm=0.0
     # This is the gate that a wrong PCA basis, a missing hands_mean or a bad
     # joint permutation must not get past.
     if check_pred:
-        from hawor.utils.process import run_mano
+        from hawor.utils.process import run_mano, run_mano_left
+        fn = run_mano if side == 'right' else run_mano_left
+        # Check in DexYCB's own convention (see the marker written below), so
+        # the gate tests our conversion rather than the shapedirs disagreement.
+        kw = {} if side == 'right' else {'fix_shapedirs': False}
         idx = np.asarray(check_pred)
-        out = run_mano(torch.from_numpy(anno['trans_r'][idx]).float()[None],
-                       torch.from_numpy(anno['rot_r'][idx]).float()[None],
-                       torch.from_numpy(anno['pose_r'][idx]).float()[None][..., None, :].reshape(1, len(idx), 45),
-                       betas=torch.from_numpy(anno['betas_r'][idx]).float()[None],
-                       use_cuda=False)
+        out = fn(torch.from_numpy(anno[f'trans_{suf}'][idx]).float()[None],
+                 torch.from_numpy(anno[f'rot_{suf}'][idx]).float()[None],
+                 torch.from_numpy(anno[f'pose_{suf}'][idx]).float()[None].reshape(1, len(idx), 45),
+                 betas=torch.from_numpy(anno[f'betas_{suf}'][idx]).float()[None],
+                 use_cuda=False, **kw)
         pred = out['joints'][0].numpy()[:, :21][:, NON_TIP_JOINTS]
         err = np.linalg.norm(pred - np.asarray(check_gt)[:, NON_TIP_JOINTS],
                              axis=-1) * 1000.0
@@ -203,6 +219,13 @@ def convert_sequence(seq_dir, calib_root, serial, out_dir, jpeg_q=92, tol_mm=0.0
         j_err = float(err.mean())
     else:
         j_err = float('nan')
+
+    if side == 'left':
+        # DexYCB fits betas with manopth, whose left MANO keeps the mirrored
+        # shapedirs of smplx issue #48. hawor_preprocess_train reads this marker
+        # and turns its correction off for this sequence; without it the shape
+        # is reinterpreted and the joints move ~15mm.
+        open(os.path.join(out_dir, 'mano_left_unfixed'), 'w').close()
 
     head_pose = np.tile(np.linalg.inv(R_90).astype(np.float32), (T, 1, 1))
     with open(os.path.join(out_dir, 'head_pose.pkl'), 'wb') as f:
