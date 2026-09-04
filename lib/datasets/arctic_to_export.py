@@ -69,6 +69,53 @@ def mano_hands_mean(side):
         _MEAN_CACHE[side] = np.array(d['hands_mean'], dtype=np.float32).reshape(45)
     return _MEAN_CACHE[side]
 
+def verify_conversion(side, rot, pose_raw, pose_converted, trans, betas, tol_mm=0.01):
+    """Check the converted parameters reproduce ARCTIC's own MANO forward pass.
+
+    ARCTIC ships no 3D joints, so unlike the HOT3D/DexYCB/H2O-3D converters
+    there is no published quantity to compare against. The equivalent reference
+    is ARCTIC's own convention: smplx MANO with flat_hand_mean=False, called
+    with pose2rot=True on the RAW stored pose, which makes smplx add hands_mean
+    internally. Our path folds hands_mean in by hand and calls with
+    pose2rot=False (rotation matrices), which skips that addition -- so the two
+    agree only if the fold-in is right.
+
+    Vertices, not joints: 778 points with no ordering ambiguity, where HaWoR's
+    wrapper remaps joints to OpenPose order and appends its own fingertips.
+
+    `pose_raw` is the pose as stored by ARCTIC and `pose_converted` is what we
+    are about to write. They are passed separately on purpose: deriving the
+    reference from the converted pose (by subtracting the mean back off) makes
+    the check reconstruct whatever it is handed and pass unconditionally. The
+    first version of this function did exactly that.
+
+    This is the check that was missing when the converter was written. A 2D
+    overlay looked correct while the omission displaced vertices by up to 75mm
+    (right) / 102mm (left).
+    """
+    import smplx
+    from hawor.utils.process import run_mano, run_mano_left
+    T = len(rot)
+    fn = run_mano if side == 'right' else run_mano_left
+    mp = '_DATA/data/mano' if side == 'right' else '_DATA/data_left/mano_left'
+    ref = smplx.MANO(model_path=mp, is_rhand=(side == 'right'), use_pca=False,
+                     flat_hand_mean=False, create_transl=False, batch_size=T)
+    if side == 'left':
+        # smplx issue #48: the left model ships inverted shapedirs. run_mano_left
+        # applies the same correction, so the reference must too.
+        ref.shapedirs[:, 0, :] *= -1
+    g = ref(global_orient=torch.from_numpy(rot).float(),
+            hand_pose=torch.from_numpy(pose_raw).float(),
+            betas=torch.from_numpy(betas).float(), return_verts=True)
+    gt = (g.vertices + torch.from_numpy(trans).float()[:, None]).detach().numpy()
+    out = fn(torch.from_numpy(trans).float()[None],
+             torch.from_numpy(rot).float()[None],
+             torch.from_numpy(pose_converted).float()[None],
+             betas=torch.from_numpy(betas).float()[None], use_cuda=False)
+    err = np.linalg.norm(out['vertices'][0].numpy() - gt, axis=-1) * 1000.0
+    return float(err.mean()), float(err.max())
+
+
 def list_sequences(arctic_root):
     """Sequences that have both raw annotations and a cropped-image archive."""
     raw = os.path.join(arctic_root, 'unpacked', 'raw_seqs')
@@ -153,6 +200,23 @@ def convert_sequence(arctic_root, sid, seq, zip_path, out_dir, ioi_offset):
                 anno[f'pose_{suffix}'][i] = m['pose'][t] + mano_hands_mean(side)
                 anno[f'trans_{suffix}'][i] = m['trans'][t]
                 anno[f'betas_{suffix}'][i] = np.asarray(m['shape'], dtype=np.float32)
+
+    # Verify before writing, on a sample of frames (the reference MANO forward
+    # is far slower than the conversion itself).
+    n_chk = min(24, n_out)
+    if n_chk:
+        sel = np.linspace(0, n_out - 1, n_chk).astype(int)
+        for side, suf in (('left', 'l'), ('right', 'r')):
+            raw_pose = np.stack([mano[side]['pose'][usable[i]] for i in sel])
+            mean_e, max_e = verify_conversion(
+                side, anno[f'rot_{suf}'][sel], raw_pose.astype(np.float32),
+                anno[f'pose_{suf}'][sel], anno[f'trans_{suf}'][sel],
+                anno[f'betas_{suf}'][sel])
+            if mean_e > 0.01:
+                raise RuntimeError(
+                    f'{out_dir}: {side} check FAILED, mean {mean_e:.5f}mm '
+                    f'max {max_e:.5f}mm over {n_chk} frames. Refusing to write '
+                    f'-- suspect the hands_mean fold-in in mano_hands_mean().')
 
     head_pose = np.einsum('tij,jk->tik', RT_c2w, np.linalg.inv(R_90)).astype(np.float32)
     with open(os.path.join(out_dir, 'head_pose.pkl'), 'wb') as f:
