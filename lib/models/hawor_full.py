@@ -204,7 +204,20 @@ class HaworFull(pl.LightningModule):
                        betas=shape[:, slot], pose2rot=False)
             j = out.joints
             j3d.append(j)
-            pts = j + trans[:, slot][:, None]
+            # Anchor the hand at its WRIST before adding the predicted
+            # translation. MANO rotates about its rest-pose root joint J0, so
+            # with transl=0 the wrist sits at J0 -- 96.1mm from the origin, and
+            # at OPPOSITE signs in x for the two hands (+-0.0957, 0.0064,
+            # 0.0062). Without this subtraction the wrist lands at J0 + trans
+            # while cam_to_trans builds trans so that (u, v) projects `trans`
+            # exactly, so the predicted image position would refer to a point
+            # 96mm away from the hand -- by ~121px at z=0.5m, and z-dependently
+            # (203px at 0.3m, 76px at 0.8m). The network can learn to absorb
+            # that, which is why trained models were not wrong, but it has to
+            # learn a depth- and slot-dependent offset to do it. Subtracting the
+            # wrist makes (u, v) mean what cam_to_trans's docstring says it
+            # means: where the hand is in the image.
+            pts = (j - j[:, :1]) + trans[:, slot][:, None]
             px = perspective_projection(pts, rotation=None, translation=None,
                                         focal_length=focal, camera_center=center)
             j2d.append(px / torch.tensor([self.in_w, self.in_h],
