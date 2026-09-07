@@ -87,3 +87,6 @@ _DATA/data_left/mano_left/*.pkl
 
 # Downloaded datasets
 /datasets
+
+# SHOW3D hand profiles / index (CC BY-NC 4.0, re-downloadable from HF)
+datasets/show3d/
