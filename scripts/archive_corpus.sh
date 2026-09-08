@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Tar+zstd each export tree into one archive per dataset, for LakeFS upload.
+#
+# zstd -3 with all cores: the payload is already-compressed JPEG, so the ratio
+# is only a few percent and the point of this step is producing ONE file per
+# dataset, not saving space.
+#
+# VERIFICATION. The previous version accepted an archive if it listed at least
+# 10 entries. That is how a 1000-clip HOT3D snapshot passed as the 1516-clip
+# corpus: the tarball was sha256-identical to its local twin, both were stale,
+# and 78,000 frames had to be re-downloaded. A checksum proves a transfer, not
+# a content. So each archive is now listed back and its sequence-directory
+# count compared against CORPUS_MANIFEST.json, which is measured from the live
+# export. A mismatch fails the dataset instead of marking it done.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+OUT="${1:-datasets/_archives}"
+MAN="$OUT/CORPUS_MANIFEST.json"
+mkdir -p "$OUT"
+
+# Superseded 4-of-10-subject DexYCB download is excluded on purpose: it is a
+# convention reference only, and shipping it beside dexycb_bronze_export would
+# invite training on both and duplicate subjects 01/02/03/06.
+DATASETS="${DATASETS:-hot3d_clips_export dexycb_bronze_export arctic_export ho3d_export h2o_export h2o3d_export}"
+
+echo "[man ] measuring exports -> $MAN"
+uv run python scripts/corpus_manifest.py "$MAN" || { echo "[FAIL] manifest"; exit 1; }
+
+expected_for() {  # dataset dir -> sequences_on_disk from the manifest
+  uv run python - "$MAN" "$1" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+for v in m['datasets'].values():
+    if v['export_dir']==sys.argv[2]:
+        print(v['sequences_on_disk']); break
+else: print(-1)
+PY
+}
+
+fail=0
+for d in $DATASETS; do
+  [ -d "datasets/$d" ] || { echo "[skip] $d absent"; continue; }
+  a="$OUT/$d.tar.zst"
+  want=$(expected_for "$d" | tr -dc 0-9)
+  if [ -z "$want" ] || [ "$want" = "-1" ]; then
+    echo "[FAIL] $d: not in manifest"; fail=1; continue
+  fi
+  if [ -f "$a.done" ]; then
+    # A .done marker is only trusted if it records the same sequence count.
+    prev=$(cat "$a.count" 2>/dev/null | tr -dc 0-9)
+    if [ "${prev:-0}" = "$want" ]; then
+      echo "[skip] $d already archived ($want seq)"; continue
+    fi
+    echo "[re  ] $d changed ($prev -> $want seq), re-archiving"
+    rm -f "$a" "$a.done" "$a.sha256" "$a.count"
+  fi
+  echo "[pack] $d ($(du -sh "datasets/$d" | cut -f1), $want seq)"
+  tar -I 'zstd -3 -T0' -cf "$a" -C datasets "$d" \
+    || { echo "[FAIL] $d: tar"; fail=1; continue; }
+  # Count sequence directories inside the archive, not just entries.
+  got=$(tar -I zstd -tf "$a" 2>/dev/null \
+        | sed -n "s|^$d/\([^/]*\)/$|\1|p" | sort -u | wc -l)
+  if [ "$got" -ne "$want" ]; then
+    echo "[FAIL] $d: archive holds $got sequence dirs, export has $want"
+    fail=1; continue
+  fi
+  sha256sum "$a" | awk '{print $1}' > "$a.sha256"
+  echo "$want" > "$a.count"
+  touch "$a.done"
+  echo "[ok  ] $d -> $(du -h "$a" | cut -f1), $got seq verified, sha $(cut -c1-12 "$a.sha256")"
+done
+
+echo
+du -ch "$OUT"/*.tar.zst 2>/dev/null | tail -1
+[ "$fail" -eq 0 ] && echo "ALL DONE" || { echo "FAILED: one or more datasets"; exit 1; }
