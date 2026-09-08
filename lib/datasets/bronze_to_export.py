@@ -245,8 +245,30 @@ def load_tables(root, project, ann_version, splits):
     return clips, frames, pa.concat_tables(anns, promote_options='default')
 
 
-def clip_rows(table, clip_id):
-    return table.filter(pc.equal(table.column('clip_id'), clip_id)).sort_by('frame_idx')
+def build_index(table):
+    """clip_id -> row indices, built once.
+
+    Replaces a per-clip `Table.filter`, for two reasons. It was O(clips x rows)
+    -- 7200 full scans of a 465,536-row table for DexYCB -- and, more bluntly,
+    pyarrow 25.0.1 SEGFAULTS in Table.filter() on that table: 4 chunks of wide
+    fixed_size_list columns. The crash takes the interpreter down with no
+    traceback, and because Python buffers stdout when it is not a TTY, a run
+    that dies this way leaves a log with no error in it at all. `take` on a
+    precomputed index does not crash and is O(rows) once.
+    """
+    cid = table.column('clip_id').to_pylist()
+    idx = {}
+    for i, c in enumerate(cid):
+        idx.setdefault(c, []).append(i)
+    return {k: np.asarray(v, dtype=np.int64) for k, v in idx.items()}
+
+
+def clip_rows(table, index, clip_id):
+    rows = index.get(clip_id)
+    if rows is None or len(rows) == 0:
+        return table.slice(0, 0)
+    import pyarrow as pa
+    return table.take(pa.array(rows)).sort_by('frame_idx')
 
 
 def extract_images(shard_path, rows, out_dir):
@@ -265,15 +287,26 @@ def extract_images(shard_path, rows, out_dir):
     return n
 
 
-def convert_clip(clip, ann, frames, out_root, project, device, fix_shapedirs,
-                 shard_dir, verify):
+def is_complete(out_dir):
+    """True if a previous run finished this clip.
+
+    convert_clip writes images, then anno.pth, then the small files with
+    ego_extrinsics.pkl last, so that file is the completion marker. A clip
+    interrupted mid-write lacks it and is redone.
+    """
+    return all(os.path.exists(os.path.join(out_dir, f))
+               for f in ('anno.pth', 'ego_extrinsics.pkl', 'intrinsics.txt'))
+
+
+def convert_clip(clip, ann, ann_idx, frames, fr_idx, out_root, project, device,
+                 fix_shapedirs, shard_dir, verify):
     cid = clip['clip_id']
     name = clip.get('source_dir') or cid.replace('/', '_')
     out_dir = os.path.join(out_root, name)
-    a = clip_rows(ann, cid)
+    a = clip_rows(ann, ann_idx, cid)
     if a.num_rows == 0:
         return None, 'no annotations'
-    fr = clip_rows(frames, cid)
+    fr = clip_rows(frames, fr_idx, cid)
 
     fidx = np.array(a.column('frame_idx').to_pylist())
     pose = np.array(a.column('mano_pose').to_pylist(), dtype=np.float64)    # (T,2,48)
@@ -409,6 +442,8 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--keep_shards', action='store_true',
                     help='do not delete each shard after it is consumed')
+    ap.add_argument('--no_resume', dest='resume', action='store_false',
+                    help='re-convert clips that already look complete')
     args = ap.parse_args()
 
     ref = resolve_ref(args.ref)
@@ -437,6 +472,10 @@ def main():
         print(f'left shapedirs: {"corrected" if fix_shapedirs else "manopth"} '
               f'(corrected {res[True] * 1000:.5f}mm vs manopth {res[False] * 1000:.5f}mm)')
 
+    # Row indices, built once. See build_index() for why this is not a filter.
+    ann_idx = build_index(ann)
+    fr_idx = build_index(frames)
+
     shard_dir = os.path.join(root, 'shards')
     os.makedirs(shard_dir, exist_ok=True)
     os.makedirs(args.out_root, exist_ok=True)
@@ -449,9 +488,16 @@ def main():
         fr_shard.setdefault(cid, set()).add(int(sh))
     order = sorted(clips, key=lambda c: min(fr_shard.get(c['clip_id'], {0})))
 
-    done, skipped, manifest = 0, [], []
+    done, skipped, manifest, resumed = 0, [], [], 0
     have = set()
     for c in order:
+        # Resume: a completed clip is neither re-fetched nor re-converted, so an
+        # interrupted run costs only the shards it had not reached.
+        name = c.get('source_dir') or c['clip_id'].replace('/', '_')
+        if args.resume and is_complete(os.path.join(args.out_root, name)):
+            manifest.append(name)
+            resumed += 1
+            continue
         need = fr_shard.get(c['clip_id'], set())
         for sh in sorted(need):
             sp = os.path.join(shard_dir, f'shard-{sh:05d}.tar')
@@ -465,7 +511,8 @@ def main():
                 print(f'  fetching shard-{sh:05d}.tar')
                 fetch(ref, args.project, f'shards/shard-{sh:05d}.tar', sp)
             have.add(sh)
-        name, res = convert_clip(c, ann, frames, args.out_root, args.project,
+        name, res = convert_clip(c, ann, ann_idx, frames, fr_idx,
+                                 args.out_root, args.project,
                                  args.device, fix_shapedirs, shard_dir,
                                  args.verify or None)
         if name is None:
@@ -483,7 +530,8 @@ def main():
                    'ann_version': args.ann_version, 'splits': args.splits,
                    'left_shapedirs': 'corrected' if fix_shapedirs else 'manopth',
                    'clips': len(manifest)}, f, indent=2)
-    print(f'\nconverted {done} clips, skipped {len(skipped)}')
+    print(f'\nconverted {done} clips, reused {resumed} already complete, '
+          f'skipped {len(skipped)}')
     for cid, why in skipped[:10]:
         print(f'  skip {cid}: {why}')
     if len(skipped) > 10:
