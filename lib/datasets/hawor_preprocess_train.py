@@ -113,13 +113,30 @@ def process_video(video_root, video, min_vis_joints=12, use_cuda=True, overwrite
     img = cv2.imread(imgfiles[0])
     H, W = img.shape[:2]
 
-    with open(os.path.join(video_dir, 'focal.txt'), 'r') as f:
-        img_focal = float(f.read())
-    # [cx, cy]. Note scripts/scripts_eval/eval_hawor_hot3d.py builds this as
-    # [h/2, w/2]; the model reads index 0 as x, so [w/2, h/2] is the correct order.
-    img_center = np.array([W / 2.0, H / 2.0], dtype=np.float32)
-    K = np.array([[img_focal, 0, img_center[0]],
-                  [0, img_focal, img_center[1]],
+    # intrinsics.txt (fx fy cx cy) is preferred when the converter wrote it.
+    # focal.txt alone forces the assumption that the principal point sits at the
+    # image centre, which is false for DexYCB (off by up to 17.6px) and HO3D
+    # (12.2px) -- at 640x480 and f~600 that is a ~15mm translation error at 0.5m,
+    # larger than the model's own error. Datasets converted before this existed
+    # have no intrinsics.txt and keep exactly the behaviour they were built with.
+    intr_path = os.path.join(video_dir, 'intrinsics.txt')
+    if os.path.exists(intr_path):
+        with open(intr_path, 'r') as f:
+            fx, fy, cx, cy = (float(v) for v in f.read().split())
+        # The npz carries ONE focal because the model's translation decode takes
+        # one; fx and fy differ by at most 0.22% in these datasets, so the mean
+        # is used there while the 2D projection below keeps them separate.
+        img_focal = (fx + fy) / 2.0
+        img_center = np.array([cx, cy], dtype=np.float32)
+    else:
+        with open(os.path.join(video_dir, 'focal.txt'), 'r') as f:
+            img_focal = float(f.read())
+        # [cx, cy]. Note scripts/scripts_eval/eval_hawor_hot3d.py builds this as
+        # [h/2, w/2]; the model reads index 0 as x, so [w/2, h/2] is the correct order.
+        img_center = np.array([W / 2.0, H / 2.0], dtype=np.float32)
+        fx = fy = img_focal
+    K = np.array([[fx, 0, img_center[0]],
+                  [0, fy, img_center[1]],
                   [0, 0, 1]], dtype=np.float32)
 
     fix_shapedirs = not os.path.exists(
