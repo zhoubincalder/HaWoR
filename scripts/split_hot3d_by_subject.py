@@ -22,7 +22,10 @@ worse. That is the point -- the previous number was measuring an easier task.
 
 Source recording comes from `000000.info.json` inside each clip tar, field
 `sequence_id`, formatted `P####_<hash>`; the participant is the part before the
-underscore.
+underscore. Clips whose tar is gone -- restored from an export archive, or
+cleaned up after conversion -- are resolved from the cached map in
+`assets/hot3d_clip_recordings.txt` instead, which is refreshed on every run.
+The script refuses to guess for a clip that has neither.
 """
 import argparse
 import json
@@ -43,6 +46,24 @@ def sequence_id(tar_path):
     return json.loads(raw)['sequence_id']
 
 
+def load_map(path):
+    """Cached `clip-XXXXXX <recording id>` map, one pair per line.
+
+    The tars are ~100MB each and are deleted once converted, so the recording
+    ids they carry cannot be re-read later -- which is exactly how a restore
+    from an export archive ended up unable to reproduce its own split. The map
+    therefore lives in `assets/`, in git, not under the gitignored `datasets/`:
+    40kB of metadata that outlives any archive is the whole point of it.
+    """
+    m = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2:
+                m[parts[0]] = parts[1]
+    return m
+
+
 def frame_count(export_root, clip):
     import numpy as np
     npz = os.path.join(export_root, clip, 'train_anno.npz')
@@ -54,17 +75,42 @@ def frame_count(export_root, clip):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--clips_dir', default='datasets/hot3d_clips/train_aria')
+    ap.add_argument('--recording_map', default='assets/hot3d_clip_recordings.txt',
+                    help='cached clip -> recording map; used for any clip whose '
+                         'tar is absent, and refreshed with whatever tars exist')
     ap.add_argument('--export_root', default='datasets/hot3d_clips_export')
     ap.add_argument('--val_participants', nargs='+', default=list(VAL_PARTICIPANTS))
     ap.add_argument('--write', action='store_true',
                     help='without this, report the split but change nothing')
     args = ap.parse_args()
 
-    clips = sorted(f[:-4] for f in os.listdir(args.clips_dir) if f.endswith('.tar'))
+    # Source of truth is the converted export -- that is what training reads.
+    # Tars are a bonus: present for freshly downloaded clips, gone for restored
+    # ones. Read whichever exist and fall back to the cached map for the rest.
+    clips = sorted(d for d in os.listdir(args.export_root)
+                   if d.startswith('clip-') and
+                   os.path.isdir(os.path.join(args.export_root, d)))
     if not clips:
-        sys.exit(f'no clip tars under {args.clips_dir}')
+        sys.exit(f'no clip directories under {args.export_root}')
 
-    seq = {c: sequence_id(os.path.join(args.clips_dir, c + '.tar')) for c in clips}
+    seq = load_map(args.recording_map) if os.path.exists(args.recording_map) else {}
+    from_tar = 0
+    if os.path.isdir(args.clips_dir):
+        for c in clips:
+            tar = os.path.join(args.clips_dir, c + '.tar')
+            if os.path.exists(tar):
+                seq[c] = sequence_id(tar)
+                from_tar += 1
+    unknown = [c for c in clips if c not in seq]
+    if unknown:
+        sys.exit(f'no recording id for {len(unknown)} clips (e.g. {unknown[:3]}); '
+                 f'need their tars or an entry in {args.recording_map}')
+    print(f'{len(clips)} clips: {from_tar} recording ids read from tars, '
+          f'{len(clips) - from_tar} from {args.recording_map}')
+    # Refresh the cache so a later restore can still reproduce this split.
+    with open(args.recording_map, 'w') as f:
+        for c in sorted(seq):
+            f.write(f'{c} {seq[c]}\n')
     part = {c: seq[c].split('_')[0] for c in clips}
 
     val_p = set(args.val_participants)
