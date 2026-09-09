@@ -50,6 +50,10 @@ class Sapiens2Wrapper(nn.Module):
         # lower blocks back into the autograd graph, so backward traverses them
         # anyway and the saving disappears.
         self._ckpt_input_grads = True
+        self._midtrunk_pool = None
+        ih = cfg.MODEL.get('INPUT_H', 1024); iw = cfg.MODEL.get('INPUT_W', 768)
+        ps = self.backbone.config.patch_size
+        self._pool_grid_hw = (ih // ps, iw // ps)
         pg = cfg.MODEL.BACKBONE.get('POOL_GRID', None)
         self.pool_grid = tuple(pg) if pg else None
         if self.pool_grid:
@@ -217,6 +221,42 @@ class Sapiens2Wrapper(nn.Module):
         print(f'FP8 training enabled on {n} Linear layers (torchao float8).')
         return n
 
+    def enable_midtrunk_pool(self, after_block, factor=2):
+        """Average-pool the patch grid 2x2 between blocks, so the deep blocks run
+        at a quarter of the tokens.
+
+        Distinct from MODEL.BACKBONE.POOL_GRID, which pools the trunk's OUTPUT
+        after all 32 blocks and measured 1.7% SLOWER at 384x512 for 192 vs 768
+        output tokens -- the head has two query tokens, so cross-attention is
+        O(2 x context) and shrinking the context saves nothing. The cost is the
+        trunk's own attention and FFN over 3072 tokens, which only a split
+        inside the trunk touches. FFN is 60.6% of a block and linear in tokens,
+        attention 24.2% and quadratic, so quartering tokens makes a block 4.9x
+        cheaper; a split after block 12 estimates 1.99x overall.
+
+        Setting this makes forward() run the trunk manually rather than calling
+        Sapiens2Backbone.forward, because that method derives its output grid
+        from pixel_values (64x48 here) and would reshape the pooled 768 patch
+        tokens against 3072 positions. Two further details the manual pass has
+        to honour: the token layout is [cls, 8 registers, patches], so only the
+        patch span may be pooled; and RoPE cos/sin are built once for the
+        original patch count and handed to every block, so new tables are
+        generated for the pooled grid -- which composes because
+        apply_rotary_pos_emb infers num_prefix_tokens as
+        num_tokens - num_patches from whatever table it receives.
+
+        The trade is spatial precision: 64x48 -> 32x24 is 16px -> 32px per
+        token. A 155px hand still spans ~5 tokens; pooling twice leaves ~2.4,
+        which is thin for the (u, v) deccam has to resolve.
+        """
+        n = len(self._layers())
+        k = int(after_block)
+        if not 0 < k < n:
+            raise ValueError(f'after_block must be in 1..{n - 1}')
+        self._midtrunk_pool = (k, int(factor))
+        print(f'Mid-trunk pooling: {factor}x{factor} after block {k} '
+              f'-> blocks {k}-{n - 1} run at 1/{factor * factor} tokens.')
+
     def freeze_pretrained(self):
         """Freeze Sapiens2 itself, leaving the projection trainable."""
         for p in self.backbone.parameters():
@@ -265,13 +305,44 @@ class Sapiens2Wrapper(nn.Module):
             self.backbone.eval()
         return self
 
+    def _trunk_pooled(self, x):
+        """Manual trunk pass with a 2x2 patch-grid pool partway through."""
+        import torch.nn.functional as F
+        k, factor = self._midtrunk_pool
+        bb = self.backbone
+        layers = self._layers()
+        hs = bb.embeddings(x)
+        pos = bb.rope_embeddings(x)
+        for layer in layers[:k]:
+            hs = layer(hs, position_embeddings=pos)
+
+        n_patch = pos[0].shape[0]
+        pre, pat = hs.split((hs.shape[1] - n_patch, n_patch), dim=1)
+        gh, gw = self._pool_grid_hw
+        b, _, d = pat.shape
+        pat = pat.transpose(1, 2).reshape(b, d, gh, gw)
+        pat = F.avg_pool2d(pat, factor)
+        ph, pw = pat.shape[-2:]
+        hs = torch.cat([pre, pat.reshape(b, d, ph * pw).transpose(1, 2)], dim=1)
+        pos = bb.rope_embeddings(x.new_zeros(1, 3, ph * bb.config.patch_size,
+                                             pw * bb.config.patch_size))
+        for layer in layers[k:]:
+            hs = layer(hs, position_embeddings=pos)
+
+        if bb.config.normalize_backbone_outputs:
+            hs = bb.norm(hs)
+        n_prefix = 1 + getattr(bb.config, 'num_register_tokens', 0)
+        return (hs[:, n_prefix:, :].reshape(b, ph, pw, d).permute(0, 3, 1, 2))
+
     def forward(self, x):
         dtype = getattr(self.backbone, 'dtype', None) or next(self.backbone.parameters()).dtype
+        run = (self._trunk_pooled if self._midtrunk_pool
+               else (lambda t: self.backbone(t).feature_maps[-1]))
         if self._frozen and not self._lora:
             with torch.no_grad():
-                feats = self.backbone(x.to(dtype)).feature_maps[-1]
+                feats = run(x.to(dtype))
         else:
-            feats = self.backbone(x.to(dtype)).feature_maps[-1]
+            feats = run(x.to(dtype))
         feats = self.proj(feats.to(self.proj.weight.dtype))
         # Pool only when asked. The crop model's space-time module rearranges with
         # a hardcoded 16x12 grid, so that path needs POOL_GRID; the full-frame

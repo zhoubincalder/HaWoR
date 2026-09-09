@@ -75,6 +75,13 @@ class HaworFull(pl.LightningModule):
         if nl and hasattr(self.backbone, 'truncate_layers'):
             self.backbone.truncate_layers(int(nl))
 
+        # Pool the patch grid 2x2 mid-trunk, so the deep blocks run at a quarter
+        # of the tokens. Not the same as POOL_GRID, which pools the trunk's
+        # output and saves nothing.
+        mp = int(cfg.MODEL.BACKBONE.get('MIDTRUNK_POOL_AFTER', 0))
+        if mp and hasattr(self.backbone, 'enable_midtrunk_pool'):
+            self.backbone.enable_midtrunk_pool(mp)
+
         # Partial fine-tune: train the first K blocks, freeze the rest. Distinct
         # from FREEZE (nothing trains) and from LORA (adapters everywhere).
         # Positive K trains the FIRST K blocks; negative trains the LAST |K|.
