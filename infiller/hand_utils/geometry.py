@@ -139,7 +139,12 @@ def rot6d_to_rotmat(x):
     a2 = x[:, :, 1]
     b1 = F.normalize(a1)
     b2 = F.normalize(a2 - torch.einsum('bi,bi->b', b1, a2).unsqueeze(-1) * b1)
-    b3 = torch.cross(b1, b2)
+    # dim=-1 explicitly: bare torch.cross picks the FIRST axis of size 3, so
+    # for a (B,3) input it silently cross-products along the batch axis when
+    # B happens to be 3. Verified: identical at B=512 and B=4, differs by 2.42
+    # at B=3. Unreachable from rot6d_to_rotmat's callers here (B is always a
+    # multiple of 32) but free to close, and linalg.cross's default differs.
+    b3 = torch.linalg.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-1)
 
 def rot6d_to_rotmat_hmr2(x: torch.Tensor) -> torch.Tensor:
@@ -156,7 +161,12 @@ def rot6d_to_rotmat_hmr2(x: torch.Tensor) -> torch.Tensor:
     a2 = x[:, :, 1]
     b1 = F.normalize(a1)
     b2 = F.normalize(a2 - torch.einsum('bi,bi->b', b1, a2).unsqueeze(-1) * b1)
-    b3 = torch.cross(b1, b2)
+    # dim=-1 explicitly: bare torch.cross picks the FIRST axis of size 3, so
+    # for a (B,3) input it silently cross-products along the batch axis when
+    # B happens to be 3. Verified: identical at B=512 and B=4, differs by 2.42
+    # at B=3. Unreachable from rot6d_to_rotmat's callers here (B is always a
+    # multiple of 32) but free to close, and linalg.cross's default differs.
+    b3 = torch.linalg.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-1)
 
 def rotmat_to_rot6d(rotmat):
