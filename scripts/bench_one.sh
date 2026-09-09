@@ -21,8 +21,12 @@ cd "$(dirname "$0")/.."
 NAME="${NAME:-bench}"
 OUT="${OUT:-/tmp/claude-1001/-home-bzhou-ws-HaWoR/c87c54eb-645e-49f2-b7c5-227a139bc1a4/scratchpad/$NAME}"
 LO="${LO:-20}"; HI="${HI:-60}"; BS="${BS:-4}"
+# Frames per window. Hardcoding 16 here silently doubled the reported
+# frames/s for a SEQ_LEN 8 run, so it is a parameter.
+SEQ="${SEQ:-16}"
 mkdir -p "$OUT"
-echo "$NAME: batch $BS, slope from $LO vs $HI steps, opts: $*"
+echo "$NAME: batch $BS x seq_len $SEQ = $((BS*SEQ)) frames/step, "\
+     "slope from $LO vs $HI steps, opts: $*"
 
 # Warm the inductor cache FIRST. torch.compile persists its artifacts to disk,
 # so an un-warmed pair has the first run paying full compilation and the second
@@ -67,7 +71,8 @@ for n in "$LO" "$HI"; do
 done
 
 wlo=$(cat "$OUT/${LO}.wall"); whi=$(cat "$OUT/${HI}.wall")
-awk -v a="$wlo" -v b="$whi" -v lo="$LO" -v hi="$HI" -v bs="$BS" -v nm="$NAME" \
+awk -v a="$wlo" -v b="$whi" -v lo="$LO" -v hi="$HI" -v bs="$BS" -v sq="$SEQ" -v nm="$NAME" \
   'BEGIN{t=(b-a)/(hi-lo);
-   printf "\n%s: %.3f s/step   %.1f frames/s   (startup+compile ~%.0fs)\n", nm, t, bs*16/t, a-lo*t}'
+   printf "\n%s: %.3f s/step   %.1f frames/s   (%d frames/step, startup+compile ~%.0fs)\n", \
+          nm, t, bs*sq/t, bs*sq, a-lo*t}'
 echo DONE

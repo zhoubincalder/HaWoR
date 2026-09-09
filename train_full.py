@@ -79,7 +79,9 @@ def main():
     def build(set_file, stride, train):
         parts = []
         for root in args.video_root:
-            ds = HaworChunkDataset(root, set_file, cfg, seq_len=16, stride=stride, train=train)
+            ds = HaworChunkDataset(root, set_file, cfg,
+                                   seq_len=cfg.MODEL.get('SEQ_LEN', 16),
+                                   stride=stride, train=train)
             if len(ds) == 0:
                 print(f'WARNING: {root} contributed 0 windows for {set_file}')
                 continue

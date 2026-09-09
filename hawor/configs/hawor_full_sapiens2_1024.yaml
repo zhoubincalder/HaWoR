@@ -51,6 +51,17 @@ MODEL:
   # pooled 16x12 grid at 384x512: identical peak memory, 1.7% slower per step.
   INPUT_H: 768
   INPUT_W: 1024
+  # Frames per training window. It does NOT raise the memory ceiling: peak
+  # memory tracks FRAMES PER STEP (batch x SEQ_LEN x 3072 tokens), so 8x4 OOMs
+  # exactly as 16x2 does, and 16 frames/step is the limit without gradient
+  # checkpointing however it is split. Measured at 1024x768, fp8, no ckpt:
+  # seq_len 16 x batch 1 = 1.332 s/step, seq_len 8 x batch 2 = 1.315 s/step --
+  # identical throughput for the same frame budget.
+  # What halving does buy is 2 independent windows per step instead of 1, from
+  # potentially different sequences, so the gradient is less correlated. The cost
+  # is that the temporal module sees 8 frames of context instead of 16, which is
+  # a modelling change a throughput number cannot evaluate.
+  SEQ_LEN: 16
   BACKBONE:
     TYPE: sapiens2
     # Any checkpoint whose state_dict carries 'backbone.*' keys. The released

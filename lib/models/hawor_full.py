@@ -47,7 +47,11 @@ class HaworFull(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(logger=False)
         self.cfg = cfg
-        self.seq_len = 16
+        # Frames per window. The temporal module and forward_step both take T
+        # from the tensor, so this only has to agree with the dataset. Halving it
+        # halves tokens per step, which is the cheapest way to get under the
+        # memory ceiling that forces gradient checkpointing.
+        self.seq_len = cfg.MODEL.get('SEQ_LEN', 16)
         self.in_h = cfg.MODEL.get('INPUT_H', 384)
         self.in_w = cfg.MODEL.get('INPUT_W', 512)
 
