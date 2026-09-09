@@ -48,9 +48,23 @@ DATASETS = [
 ]
 
 
-def check_window(b, in_w, in_h):
-    """Return a list of problem strings for one sample."""
+def check_window(b):
+    """Return a list of problem strings for one sample.
+
+    The frame size is read from the sample, not the config: under
+    MODEL.NATIVE_RES each dataset (and each resolution-jitter draw) has its own,
+    so a config-derived bound would pass everything by being too loose on the
+    small datasets and reject the padding on the large ones.
+    """
     bad = []
+    in_h, in_w = b['img'].shape[-2:]
+    if 'img_size' in b:
+        sw, sh = (int(x) for x in b['img_size'][0])
+        if (sw, sh) != (in_w, in_h):
+            bad.append(f'img_size {sw}x{sh} != image tensor {in_w}x{in_h}')
+    if in_h % 16 or in_w % 16:
+        bad.append(f'{in_w}x{in_h} not a multiple of the 16px patch; '
+                   f'the stride-16 conv would drop the remainder')
     for k, v in b.items():
         if not torch.isfinite(v).all():
             n = int((~torch.isfinite(v)).sum())
@@ -97,14 +111,24 @@ def main():
     ap.add_argument('--samples', type=int, default=8,
                     help='windows drawn per fold')
     ap.add_argument('--only', nargs='*', default=None)
+    ap.add_argument('--native', action='store_true',
+                    help='force MODEL.NATIVE_RES on, whatever the config says')
     args = ap.parse_args()
 
     from hawor.configs import get_config
     from lib.datasets.hawor_full_dataset import HaworFullDataset
     cfg = get_config(args.cfg, merge=True)
+    if args.native:
+        cfg.defrost()
+        cfg.MODEL.NATIVE_RES = True
+        cfg.TRAIN.BATCH_SIZE = 1          # native mode's own precondition
+        cfg.freeze()
     in_h = cfg.MODEL.get('INPUT_H', 384)
     in_w = cfg.MODEL.get('INPUT_W', 512)
-    print(f'config {args.cfg}: input {in_h}x{in_w}\n')
+    native = cfg.MODEL.get('NATIVE_RES', False)
+    print(f'config {args.cfg}: input {in_h}x{in_w}'
+          + (f', NATIVE_RES on (jitter {list(cfg.MODEL.get("RES_JITTER_LEVELS", []))})'
+             if native else '') + '\n')
 
     rows, failures = [], 0
     for name, root in DATASETS:
@@ -133,7 +157,7 @@ def main():
                 continue
             rng = np.random.default_rng(0)
             idx = rng.choice(len(ds), size=min(args.samples, len(ds)), replace=False)
-            probs, nvalid = [], 0
+            probs, nvalid, sizes = [], 0, set()
             for i in idx:
                 try:
                     b = ds[int(i)]
@@ -141,11 +165,15 @@ def main():
                     probs.append(f'window {i}: {type(e).__name__}: {e}')
                     continue
                 nvalid += int(b['gt_valid'].sum())
-                probs += [f'window {i}: {p}' for p in check_window(b, in_w, in_h)]
+                probs += [f'window {i}: {p}' for p in check_window(b)]
+                sizes.add(tuple(b['img'].shape[-2:]))
             status = 'OK' if not probs else f'{len(probs)} PROBLEM(S)'
             rows.append((name, fold, len(ds), nvalid, status))
+            shp = ' '.join(f'{w}x{h}' for h, w in sorted(sizes))
+            tok = sorted({(h // 16) * (w // 16) for h, w in sizes})
             print(f'{name:8} {fold:5} {len(ds):7} windows  '
-                  f'{nvalid:5} valid hand-frames in {len(idx)} sampled  {status}')
+                  f'{nvalid:5} valid hand-frames in {len(idx)} sampled  '
+                  f'[{shp} = {tok} tok]  {status}')
             for p in probs[:6]:
                 print(f'    - {p}')
             if probs:

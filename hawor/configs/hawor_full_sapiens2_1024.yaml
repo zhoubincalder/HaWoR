@@ -79,6 +79,35 @@ MODEL:
   # pooled 16x12 grid at 384x512: identical peak memory, 1.7% slower per step.
   INPUT_H: 768
   INPUT_W: 1024
+  # Feed each source at its OWN resolution instead of this canvas, padded up to
+  # a multiple of the 16px patch, and never upsampled. INPUT_H/W then act only
+  # as a ceiling: a source larger than them is still scaled down to fit, which
+  # is why H2O (1280x720, whose native 3600 tokens would EXCEED the canvas)
+  # stays at 1024x576 rather than getting its native grid.
+  # Tokens per window, and share of an epoch's frame-slots:
+  #   dexycb 640x480 -> 30x40 1200 (39.4%)   ho3d  640x480 -> 1200 ( 8.5%)
+  #   hot3d  704x704 -> 44x44 1936 (22.1%)   h2o  1280x720 -> 1024x576
+  #   arctic 840x600 -> 848x608 38x53 2014          -> 45x64 2304 ( 6.2%)
+  #     (padded: 840 and 600 are NOT multiples of 16)
+  #                                          h2o3d 640x480 -> 1200 ( 6.0%)
+  # Weighted 1576 of 3072 tokens -> ~2.0x faster with no interpolation at all.
+  # The cost is token budget on the hand, not information: the corpus-weighted
+  # hand span falls from 10.7 tokens to 8.1 (a uniform 640x480 canvas would give
+  # 6.7). Sapiens2 tolerates this by construction -- RoPE coordinates are
+  # computed from the actual input each forward and normalized per axis to
+  # [-1,1], and pretraining augmented the coordinate scale over a 4x range.
+  # REQUIRES BATCH_SIZE 1: collate stacks (B,T,3,H,W), and windows now differ in
+  # size between datasets and between jitter draws. A window's own 16 frames
+  # always agree, being one sequence, so batch 1 needs no bucketing.
+  NATIVE_RES: False
+  # Resolution jitter, train only, multiplying the scale above. Replaces the
+  # scale variation the fixed canvas used to supply -- without it every DexYCB
+  # frame is 40x30 forever. Down only: scaling up would invent pixels, which is
+  # what NATIVE_RES exists to avoid. Discrete rather than continuous so the
+  # number of distinct tensor shapes stays bounded (4 source sizes x 3 levels =
+  # 12), which matters because torch.compile builds a graph per shape and the
+  # fp8 path needs compile to be worth anything.
+  RES_JITTER_LEVELS: [1.0, 0.875, 0.75]
   # Frames per training window. It does NOT raise the memory ceiling: peak
   # memory tracks FRAMES PER STEP (batch x SEQ_LEN x 3072 tokens), so 8x4 OOMs
   # exactly as 16x2 does, and 16 frames/step is the limit without gradient

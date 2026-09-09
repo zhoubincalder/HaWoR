@@ -216,12 +216,21 @@ class HaworFull(pl.LightningModule):
               'lr': self.cfg.TRAIN.LR}],
             weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
 
-    def cam_to_trans(self, cam, focal, center):
+    def cam_to_trans(self, cam, focal, center, size=None):
         """(u_norm, v_norm, log_depth) -> camera-space translation, via the known
         intrinsics. Predicting image position rather than a crop-relative offset
-        keeps the 2D loss directly informative about where the hand is."""
-        u = (cam[..., 0] + 0.5) * self.in_w
-        v = (cam[..., 1] + 0.5) * self.in_h
+        keeps the 2D loss directly informative about where the hand is.
+
+        `size` is the per-sample (W, H) of the input tensor, broadcastable against
+        cam. Under MODEL.NATIVE_RES every sample carries its own input size, so
+        taking it from the config would denormalize (u, v) against the wrong
+        frame -- silently, and by up to 1.6x on the 640x480 datasets."""
+        if size is None:
+            in_w, in_h = self.in_w, self.in_h
+        else:
+            in_w, in_h = size[..., 0], size[..., 1]
+        u = (cam[..., 0] + 0.5) * in_w
+        v = (cam[..., 1] + 0.5) * in_h
         z = Z0 * torch.exp(cam[..., 2].clamp(-2.0, 2.0))
         tx = (u - center[..., 0]) * z / focal
         ty = (v - center[..., 1]) * z / focal
@@ -242,8 +251,13 @@ class HaworFull(pl.LightningModule):
         rotmat = rot6d_to_rotmat(pose.reshape(-1, 6)).reshape(B * T, 2, 16, 3, 3)
         focal = batch['img_focal'].flatten(0, 1)               # (B*T,)
         center = batch['img_center'].flatten(0, 1)             # (B*T,2)
+        if 'img_size' in batch:
+            size = batch['img_size'].flatten(0, 1)             # (B*T,2) as (W,H)
+        else:
+            size = img.new_tensor([self.in_w, self.in_h]).expand(B * T, 2)
         # broadcast over the two hand slots for the translation decode
-        trans = self.cam_to_trans(cam, focal[:, None], center[:, None, :])   # (B*T,2,3)
+        trans = self.cam_to_trans(cam, focal[:, None], center[:, None, :],
+                                  size[:, None, :])            # (B*T,2,3)
 
         j3d, j2d = [], []
         for slot, mano in ((0, self.mano_left), (1, self.mano_right)):
@@ -268,8 +282,7 @@ class HaworFull(pl.LightningModule):
             pts = (j - j[:, :1]) + trans[:, slot][:, None]
             px = perspective_projection(pts, rotation=None, translation=None,
                                         focal_length=focal, camera_center=center)
-            j2d.append(px / torch.tensor([self.in_w, self.in_h],
-                                         device=px.device, dtype=px.dtype) - 0.5)
+            j2d.append(px / size[:, None, :].to(px.dtype) - 0.5)
         return {
             'pred_pose': pose, 'pred_shape': shape, 'pred_cam': cam, 'pred_vis': vis,
             'pred_rotmat': rotmat, 'pred_trans': trans,

@@ -18,7 +18,10 @@ cd "$(dirname "$0")/.."
 
 CFG="${CFG:-hawor/configs/hawor_full_sapiens2_1024.yaml}"
 STEPS="${STEPS:-12}"
-OUT="${OUT:-/tmp/claude-1001/-home-bzhou-ws-HaWoR/c02b2b23-25a7-4f07-af28-a8aa1bcd165f/scratchpad/smoke_logs}"
+OUT="${OUT:-datasets/smoke_logs}"
+# Appended as train_full.py --opts, which is argparse.REMAINDER and so must be
+# last. e.g. OPTS="MODEL.NATIVE_RES True TRAIN.BATCH_SIZE 1"
+OPTS="${OPTS:-}"
 LOG=datasets/smoke_train.log
 : >"$LOG"
 mkdir -p "$OUT"
@@ -34,7 +37,7 @@ declare -A ROOTS=(
 )
 ORDER="${ORDER:-ho3d h2o3d h2o arctic hot3d dexycb}"
 
-say "config $CFG, $STEPS steps per dataset"
+say "config $CFG, $STEPS steps per dataset${OPTS:+, opts: $OPTS}"
 fail=0
 for d in $ORDER; do
   r="${ROOTS[$d]}"
@@ -50,7 +53,8 @@ for d in $ORDER; do
     --exp_name "smoke_$d" \
     --out_dir "$OUT" \
     --max_steps "$STEPS" \
-    --limit_val_batches 2 >"$l" 2>&1
+    --limit_val_batches 2 \
+    ${OPTS:+--opts $OPTS} >"$l" 2>&1
   rc=$?
   # A crash that takes the interpreter down leaves no traceback and, with
   # buffered stdout, no output either -- so the exit code is checked first.
@@ -65,8 +69,14 @@ for d in $ORDER; do
   if grep -aqiE "\bnan\b|\binf\b" <<<"$last"; then
     say "[FAIL] $d non-finite loss: $last"; fail=1; continue
   fi
-  win=$(grep -aoE "-> [0-9]+ windows" "$l" | head -1)
-  say "[ok  ] $d  $win  ${last:-no loss line captured}"
+  # `--` or grep reads the "->" pattern as an option bundle and dies.
+  win=$(grep -aoE -- "-> [0-9]+ windows" "$l" | head -1)
+  # Record the input mode and the observed step rate. A run that silently fell
+  # back to the fixed canvas would otherwise look identical in this summary,
+  # and the rate is the whole point of NATIVE_RES.
+  sz=$(grep -aoE "frames at [^(]*" "$l" | head -1 | sed 's/frames at //;s/, *$//;s/ *$//')
+  rate=$(grep -aoE "[0-9.]+(it/s|s/it)" "$l" | tail -1)
+  say "[ok  ] $d  $win  [$sz]  ${rate:-no rate}  ${last:-no loss line captured}"
 done
 
 say "=== summary ==="

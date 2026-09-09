@@ -10,11 +10,26 @@ Differences from the per-hand crop dataset (hawor_train_dataset.py):
   uniform scale plus offset: f' = f*s, c' = c*s + pad. Anisotropic resizing would
   make the two focal lengths differ, which HaWoR's single-focal projection cannot
   express.
+- MODEL.NATIVE_RES switches the target from a fixed canvas to each source's own
+  resolution, padded up to a multiple of the 16px patch. Nothing is upsampled
+  (the corpus is 640x480 to 840x600, all smaller than 1024x768, so the fixed
+  canvas was interpolating 93.8% of frames up for no added information) and the
+  letterbox dead space goes away with it. A source too large for the canvas is
+  still scaled down to fit, so the token budget is never exceeded. Windows then
+  vary in size between samples, which is fine at BATCH_SIZE 1 -- a window's 16
+  frames all come from one sequence, so they always agree -- but needs
+  aspect-ratio bucketing above that, since collate stacks (B,T,3,H,W).
 - Ground truth keeps a leading hand axis (slot 0 left, slot 1 right) plus a
   per-hand validity flag, since on a full frame a hand is often absent -- with
   crops that case never reached the model.
-- Only colour augmentation. Scale/translation jitter existed to perturb the crop
-  box; there is no crop here, and warping the frame would change the intrinsics.
+- Only colour augmentation, plus resolution jitter under NATIVE_RES. Scale and
+  translation jitter existed to perturb the crop box; there is no crop here, and
+  warping the frame would change the intrinsics. Resolution jitter is the one
+  scale augmentation that survives, because a uniform rescale is exactly what
+  the letterbox already does to the camera. It only ever scales DOWN -- scaling
+  up would invent pixels, which is what native mode exists to avoid -- and it
+  draws from a short discrete list rather than a continuous range so the number
+  of distinct tensor shapes stays bounded for torch.compile.
 """
 import json
 import os
@@ -43,6 +58,17 @@ class HaworFullDataset(torch.utils.data.Dataset):
         self.anno_name = anno_name
         self.in_h = cfg.MODEL.get('INPUT_H', 384)
         self.in_w = cfg.MODEL.get('INPUT_W', 512)
+        self.native_res = bool(cfg.MODEL.get('NATIVE_RES', False))
+        self.jitter_levels = list(cfg.MODEL.get('RES_JITTER_LEVELS', []))
+        if self.native_res and cfg.TRAIN.get('BATCH_SIZE', 1) > 1:
+            # Fail here rather than in default_collate, which reports only a
+            # shape mismatch and does not say why the shapes differ.
+            raise ValueError(
+                f'MODEL.NATIVE_RES needs TRAIN.BATCH_SIZE 1, got '
+                f'{cfg.TRAIN.BATCH_SIZE}: windows differ in size between '
+                f'datasets and between resolution-jitter draws, and collate '
+                f'stacks them into one (B,T,3,H,W) tensor. Use ACCUM_STEPS for '
+                f'a larger effective batch, or add aspect-ratio bucketing.')
         self.color_scale = cfg.DATASETS.CONFIG.get('COLOR_SCALE', 0.2)
 
         self.normalize_img = Compose([
@@ -53,8 +79,12 @@ class HaworFullDataset(torch.utils.data.Dataset):
             self.videos = json.load(f)
         self._anno, self._imgs = {}, {}
         self.index = self._build_index(stride)
+        size = ('native, capped at %dx%d' % (self.in_h, self.in_w) if self.native_res
+                else '%dx%d' % (self.in_h, self.in_w))
+        jit = (f', jitter {self.jitter_levels}'
+               if self.native_res and self.jitter_levels and train else '')
         print(f'[HaworFullDataset] {len(self.videos)} sequences -> {len(self.index)} '
-              f'windows of {seq_len} frames at {self.in_h}x{self.in_w} (train={train})')
+              f'windows of {seq_len} frames at {size}{jit} (train={train})')
 
     # ---------------------------------------------------------------- indexing
     def _path(self, v):
@@ -112,9 +142,22 @@ class HaworFullDataset(torch.utils.data.Dataset):
         frames = np.arange(start, start + self.seq_len)
 
         W0, H0 = int(anno['img_size'][0]), int(anno['img_size'][1])
-        s = min(self.in_h / H0, self.in_w / W0)
-        new_w, new_h = int(round(W0 * s)), int(round(H0 * s))
-        pad_x, pad_y = (self.in_w - new_w) // 2, (self.in_h - new_h) // 2
+        fit = min(self.in_h / H0, self.in_w / W0)
+        if self.native_res:
+            # min(1, fit): keep the source's own pixels, and scale down only when
+            # it does not fit the canvas budget. Then pad TIGHTLY to a multiple of
+            # the patch -- 840x600 -> 848x608, not 1024x768 -- because a conv with
+            # stride 16 silently DROPS the remainder rather than erroring.
+            s = min(1.0, fit)
+            if self.train and self.jitter_levels:
+                s *= float(np.random.choice(self.jitter_levels))
+            new_w, new_h = int(round(W0 * s)), int(round(H0 * s))
+            out_w, out_h = -(-new_w // 16) * 16, -(-new_h // 16) * 16
+        else:
+            s = fit
+            new_w, new_h = int(round(W0 * s)), int(round(H0 * s))
+            out_w, out_h = self.in_w, self.in_h
+        pad_x, pad_y = (out_w - new_w) // 2, (out_h - new_h) // 2
 
         focal = float(anno['img_focal']) * s
         ic = anno['img_center'].astype(np.float32) * s + np.array([pad_x, pad_y], np.float32)
@@ -126,7 +169,7 @@ class HaworFullDataset(torch.utils.data.Dataset):
         for t in frames:
             im = cv2.imread(files[t])[:, :, ::-1]
             im = cv2.resize(im, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            canvas = np.zeros((self.in_h, self.in_w, 3), np.float32)
+            canvas = np.zeros((out_h, out_w, 3), np.float32)
             canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = im
             if self.train:
                 canvas = canvas * color[None, None, :]
@@ -138,8 +181,8 @@ class HaworFullDataset(torch.utils.data.Dataset):
         conf = sl(anno['j2d_conf']).astype(np.float32)
         valid = sl(anno['valid'].astype(np.float32))
         # Joints landing outside the letterboxed frame carry no signal.
-        inside = ((j2d[..., 0] >= 0) & (j2d[..., 0] < self.in_w) &
-                  (j2d[..., 1] >= 0) & (j2d[..., 1] < self.in_h)).astype(np.float32)
+        inside = ((j2d[..., 0] >= 0) & (j2d[..., 0] < out_w) &
+                  (j2d[..., 1] >= 0) & (j2d[..., 1] < out_h)).astype(np.float32)
 
         return {
             'img': torch.stack(imgs).float(),                                    # (T,3,H,W)
@@ -147,8 +190,11 @@ class HaworFullDataset(torch.utils.data.Dataset):
             'img_center': torch.from_numpy(ic).float().unsqueeze(0).repeat(self.seq_len, 1),
             'gt_valid': torch.from_numpy(valid).float(),                          # (T,2)
             # Normalized over the input frame, matching how the model projects.
+            # The model reads (W,H) from here rather than from the config, so the
+            # (u,v) decode and the 2D loss follow a per-sample input size.
+            'img_size': torch.tensor([out_w, out_h]).float().unsqueeze(0).repeat(self.seq_len, 1),
             'gt_j2d': torch.from_numpy(
-                j2d / np.array([self.in_w, self.in_h], np.float32) - 0.5).float(),  # (T,2,J,2)
+                j2d / np.array([out_w, out_h], np.float32) - 0.5).float(),  # (T,2,J,2)
             'gt_j2d_conf': torch.from_numpy(conf * inside).float(),
             'gt_j3d_wo_trans': torch.from_numpy(sl(anno['j3d_wo_trans'])).float(),
             'gt_pose': torch.from_numpy(sl(anno['cam_pose'])).float(),            # (T,2,48)
