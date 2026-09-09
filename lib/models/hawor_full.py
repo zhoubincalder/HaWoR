@@ -170,17 +170,6 @@ class HaworFull(pl.LightningModule):
                                - self.mano_right.shapedirs[:, 0, :])) < 1:
             self.mano_left.shapedirs[:, 0, :] *= -1
 
-        # MODEL.BACKBONE.TORCH_COMPILE existed in the config but was only ever
-        # read by lib/models/hawor.py, so setting it here did nothing. Wired now,
-        # and applied to the backbone and head only -- not the losses, which mask
-        # by per-frame validity and so have data-dependent shapes that would
-        # force a recompile every step.
-        if cfg.MODEL.BACKBONE.get('TORCH_COMPILE', 0):
-            mode = cfg.MODEL.BACKBONE.get('TORCH_COMPILE_MODE', 'default')
-            self.backbone = torch.compile(self.backbone, mode=mode)
-            self.head = torch.compile(self.head, mode=mode)
-            print(f'torch.compile enabled on backbone and head (mode={mode})')
-
         self.automatic_optimization = False
 
         # Warm start from a previous run's weights, tolerating structural
@@ -199,6 +188,33 @@ class HaworFull(pl.LightningModule):
             if head_missing:
                 print(f'  NOTE {len(head_missing)} non-backbone keys did not load, '
                       f'e.g. {head_missing[:3]}')
+
+        # AFTER the warm start, not before: torch.compile returns an
+        # OptimizedModule that renames every child key with an `_orig_mod.`
+        # prefix, so a state_dict saved from an uncompiled run would land
+        # entirely in `unexpected` and, since this loads with strict=False,
+        # would leave the backbone at its pretrained weights without failing.
+        # Applied to the backbone and head only -- not the losses, which mask by
+        # per-frame validity and so have data-dependent shapes that would force
+        # a recompile every step.
+        if cfg.MODEL.BACKBONE.get('TORCH_COMPILE', 0):
+            mode = cfg.MODEL.BACKBONE.get('TORCH_COMPILE_MODE', 'default')
+            # Dynamo compiles one graph per input shape and gives up after
+            # `recompile_limit` of them (default 8), silently running every
+            # later shape in EAGER for the rest of the run. Under NATIVE_RES the
+            # shape count is (source sizes) x (jitter levels) -- 12 here -- so
+            # the default is exceeded at about step 25 and a third of the shapes
+            # never get compiled. That costs speed and, since compile also cuts
+            # activation memory (59.2 -> 41.1 GB at 1200 tokens), memory too.
+            import torch._dynamo as _dynamo
+            lim = int(cfg.MODEL.BACKBONE.get('RECOMPILE_LIMIT', 64))
+            for attr in ('recompile_limit', 'cache_size_limit'):   # renamed in 2.x
+                if hasattr(_dynamo.config, attr):
+                    setattr(_dynamo.config, attr, lim)
+            self.backbone = torch.compile(self.backbone, mode=mode)
+            self.head = torch.compile(self.head, mode=mode)
+            print(f'torch.compile enabled on backbone and head '
+                  f'(mode={mode}, recompile_limit={lim})')
 
     def train(self, mode: bool = True):
         super().train(mode)

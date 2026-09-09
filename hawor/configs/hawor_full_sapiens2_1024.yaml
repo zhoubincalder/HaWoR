@@ -108,6 +108,15 @@ MODEL:
   # 12), which matters because torch.compile builds a graph per shape and the
   # fp8 path needs compile to be worth anything.
   RES_JITTER_LEVELS: [1.0, 0.875, 0.75]
+  # 0 = off. A token ceiling applied under NATIVE_RES, before jitter: any source
+  # whose padded grid would exceed it is scaled down until it fits. Peak memory
+  # is linear in tokens, so this is the direct way to state the memory limit,
+  # and unlike CKPT_ABOVE_TOKENS it removes the large shapes rather than paying
+  # to recompute them -- which lets GRAD_CHECKPOINT go off for the whole run.
+  # The trade is resolution: at 1550, HOT3D caps at 0.895x native, ARCTIC 0.875x
+  # and H2O 0.82x of its already-fitted size, so those three give up their top
+  # detail. DexYCB/HO3D/H2O3D are unaffected, being 1200 tokens natively.
+  MAX_TOKENS: 0
   # Frames per training window. It does NOT raise the memory ceiling: peak
   # memory tracks FRAMES PER STEP (batch x SEQ_LEN x 3072 tokens), so 8x4 OOMs
   # exactly as 16x2 does, and 16 frames/step is the limit without gradient
@@ -154,6 +163,12 @@ MODEL:
     CKPT_ABOVE_TOKENS: 0
     # No POOL_GRID: keep the backbone's native 48x64 grid.
     TORCH_COMPILE: 0
+    # Distinct input shapes Dynamo may compile before falling back to eager for
+    # the rest of the run. Torch's default is 8; NATIVE_RES needs
+    # (source sizes) x (jitter levels), which is 12 for this corpus, so the
+    # default silently de-optimizes a third of the shapes. Keep it comfortably
+    # above the shape count -- an unused slot costs nothing.
+    RECOMPILE_LIMIT: 64
     # Both 0 = off. NUM_LAYERS keeps only the first N transformer blocks, for a
     # cheaper trunk than any released checkpoint offers (24 of the 0.8b's 32
     # measures 0.604B). TRAINABLE_LAYERS: positive K trains the FIRST K blocks,

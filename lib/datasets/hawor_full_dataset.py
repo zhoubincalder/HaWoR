@@ -60,6 +60,8 @@ class HaworFullDataset(torch.utils.data.Dataset):
         self.in_w = cfg.MODEL.get('INPUT_W', 512)
         self.native_res = bool(cfg.MODEL.get('NATIVE_RES', False))
         self.jitter_levels = list(cfg.MODEL.get('RES_JITTER_LEVELS', []))
+        self.max_tokens = int(cfg.MODEL.get('MAX_TOKENS', 0))
+        self._budget = {}
         if self.native_res and cfg.TRAIN.get('BATCH_SIZE', 1) > 1:
             # Fail here rather than in default_collate, which reports only a
             # shape mismatch and does not say why the shapes differ.
@@ -85,6 +87,30 @@ class HaworFullDataset(torch.utils.data.Dataset):
                if self.native_res and self.jitter_levels and train else '')
         print(f'[HaworFullDataset] {len(self.videos)} sequences -> {len(self.index)} '
               f'windows of {seq_len} frames at {size}{jit} (train={train})')
+
+    def _budget_scale(self, W0, H0):
+        """Largest scale <= 1 whose padded patch grid fits MODEL.MAX_TOKENS.
+
+        Peak memory is linear in tokens, so a token budget is the honest way to
+        express the memory ceiling: it caps every dataset at once, needs no
+        per-dataset tuning, and covers any dataset added later. Capping the
+        input instead of recomputing activations is a real trade -- ARCTIC and
+        H2O give up their top resolution, and with it some hand detail -- but it
+        means NO window exceeds the budget, so recomputation can be switched off
+        for the whole run rather than for most of it.
+
+        Solved by search rather than in closed form because the padding is a
+        ceiling to a multiple of 16, which is a step function.
+        """
+        key = (W0, H0)
+        if key in self._budget:
+            return self._budget[key]
+        tok = lambda s: (-(-int(round(H0 * s)) // 16)) * (-(-int(round(W0 * s)) // 16))
+        s = 1.0
+        while s > 0.05 and tok(s) > self.max_tokens:
+            s -= 0.005
+        self._budget[key] = s
+        return s
 
     # ---------------------------------------------------------------- indexing
     def _path(self, v):
@@ -149,6 +175,10 @@ class HaworFullDataset(torch.utils.data.Dataset):
             # the patch -- 840x600 -> 848x608, not 1024x768 -- because a conv with
             # stride 16 silently DROPS the remainder rather than erroring.
             s = min(1.0, fit)
+            # Budget cap BEFORE jitter, so jitter still scales down from the
+            # largest allowed size and keeps its full spread.
+            if self.max_tokens:
+                s = min(s, self._budget_scale(W0, H0))
             if self.train and self.jitter_levels:
                 s *= float(np.random.choice(self.jitter_levels))
             new_w, new_h = int(round(W0 * s)), int(round(H0 * s))
