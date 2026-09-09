@@ -12,6 +12,7 @@ and subject lists, and the git commit that produced them. archive_corpus.sh
 verifies each archive against these counts before marking it done, and a
 consumer can check a restore the same way.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -49,6 +50,25 @@ def subject_of(name):
     return m.group(0) if m else name
 
 
+def fingerprint(root, seqs):
+    """Cheap content fingerprint over the label files.
+
+    A sequence COUNT does not detect a rewrite. ARCTIC's intrinsics fix left all
+    301 sequences in place and only changed what is inside each train_anno.npz,
+    so a count-based staleness check would have happily re-uploaded nothing and
+    left the remote holding the wrong labels. Hashing (name, size, mtime_ns) of
+    every npz catches any rewrite without reading 17GB.
+    """
+    h = hashlib.sha256()
+    for s in seqs:
+        p = os.path.join(root, s, 'train_anno.npz')
+        if not os.path.exists(p):
+            continue
+        st = os.stat(p)
+        h.update(f'{s}:{st.st_size}:{st.st_mtime_ns}\n'.encode())
+    return h.hexdigest()
+
+
 def describe(root):
     """Measured contents of one export tree."""
     if not os.path.isdir(root):
@@ -79,6 +99,7 @@ def describe(root):
     src = os.path.join(root, 'bronze_source.json')
     entry = {
         'sequences_on_disk': len(seqs),
+        'content_fingerprint': fingerprint(root, seqs),
         'preprocessed': sum(
             os.path.exists(os.path.join(root, s, 'train_anno.npz')) for s in seqs),
         'first_sequence': seqs[0] if seqs else None,

@@ -131,6 +131,17 @@ class HaworFull(pl.LightningModule):
                                - self.mano_right.shapedirs[:, 0, :])) < 1:
             self.mano_left.shapedirs[:, 0, :] *= -1
 
+        # MODEL.BACKBONE.TORCH_COMPILE existed in the config but was only ever
+        # read by lib/models/hawor.py, so setting it here did nothing. Wired now,
+        # and applied to the backbone and head only -- not the losses, which mask
+        # by per-frame validity and so have data-dependent shapes that would
+        # force a recompile every step.
+        if cfg.MODEL.BACKBONE.get('TORCH_COMPILE', 0):
+            mode = cfg.MODEL.BACKBONE.get('TORCH_COMPILE_MODE', 'default')
+            self.backbone = torch.compile(self.backbone, mode=mode)
+            self.head = torch.compile(self.head, mode=mode)
+            print(f'torch.compile enabled on backbone and head (mode={mode})')
+
         self.automatic_optimization = False
 
         # Warm start from a previous run's weights, tolerating structural
