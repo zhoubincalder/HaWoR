@@ -82,7 +82,12 @@ MODEL:
     # also the conventional recipe: the blocks nearest the head should adapt.
     NUM_LAYERS: 0
     TRAINABLE_LAYERS: 0
-    # Real fp8 training (torchao float8). Needs TORCH_COMPILE or it is ~3x slower.
+    # Real fp8 training (torchao float8), as opposed to FP8 above which is
+    # inference quantization and silently skips unless the trunk is frozen.
+    # Needs TORCH_COMPILE or it is ~3x slower. MEASURED SLOWER THAN bf16 ON A
+    # FULL FINE-TUNE: ~25 s/step vs 11.111, i.e. 0.44x, because gradient
+    # checkpointing (mandatory here) recomputes the forward and so runs every
+    # fp8 cast twice across 224 Linears. Leave it off for FREEZE: False.
     FP8_TRAINING: False
   # Warm-start head + motion module from the frozen-backbone full-frame run so
   # the 3D heads do not have to relearn placement from scratch while the

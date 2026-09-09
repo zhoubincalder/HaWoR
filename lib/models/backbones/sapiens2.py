@@ -185,6 +185,24 @@ class Sapiens2Wrapper(nn.Module):
         block at 3072 tokens: bf16 14.35 ms, fp8 eager 43.75 ms (3x SLOWER, the
         scale/cast ops dominate), fp8 compiled 10.67 ms (1.35x). Enabling this
         without TORCH_COMPILE is a pessimisation, so it says so.
+
+        DO NOT USE THIS FOR A FULL FINE-TUNE. That 1.35x does not survive
+        end-to-end. Measured on the 0.8B/32L full fine-tune at 768x1024, batch 4,
+        with all 224 Linears converted and compile on: ~25 s/step against bf16's
+        11.111, i.e. 0.44x -- 2.25x SLOWER. The isolated block above had no
+        gradient checkpointing, which is why it did not predict this. A full
+        fine-tune must recompute activations (>99 GB otherwise), so every fp8
+        cast and dynamic scale runs TWICE, and across 224 Linears that costs more
+        than the fp8 matmuls save.
+
+        Contrast MODEL.BACKBONE.FP8, torchao's *inference* quantization on a
+        frozen trunk: no backward, so no recomputation, and that path measured
+        1.553 s/step against 11.111 -- 7.15x. fp8 pays where there is no backward
+        pass to checkpoint and loses where there is. The two are not the same
+        feature and the frozen result does not transfer.
+
+        Where this may still pay is a partial fine-tune (TRAINABLE_LAYERS), where
+        fewer blocks are recomputed. Unmeasured.
         """
         from torchao.float8 import convert_to_float8_training, Float8LinearConfig
         # fp8 matmuls need both inner dims divisible by 16; skip anything else
