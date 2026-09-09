@@ -56,7 +56,11 @@ for d in $DATASETS; do
     if [ "${prev:-0}" = "$want" ] && [ "${prevfp:-x}" = "$fp" ]; then
       echo "[skip] $d already archived ($want seq, fingerprint matches)"; continue
     fi
-    if [ "${prev:-0}" = "$want" ]; then
+    if [ -z "$prevfp" ]; then
+      # First run after content_fingerprint was introduced: absence is not
+      # evidence of change, so do not claim the content changed.
+      echo "[re  ] $d has no recorded fingerprint, re-archiving to establish one"
+    elif [ "${prev:-0}" = "$want" ]; then
       echo "[re  ] $d same $want seq but CONTENT CHANGED, re-archiving"
     else
       echo "[re  ] $d changed ($prev -> $want seq), re-archiving"

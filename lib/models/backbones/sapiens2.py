@@ -44,6 +44,12 @@ class Sapiens2Wrapper(nn.Module):
         nn.init.zeros_(self.proj.bias)
         self._frozen = False
         self._lora = False
+        # Only a fully frozen base (LoRA) needs the embedding output forced to
+        # require grad for checkpointing. A partial fine-tune does not, and for
+        # a train-the-TOP split it is actively harmful: it drags the frozen
+        # lower blocks back into the autograd graph, so backward traverses them
+        # anyway and the saving disappears.
+        self._ckpt_input_grads = True
         pg = cfg.MODEL.BACKBONE.get('POOL_GRID', None)
         self.pool_grid = tuple(pg) if pg else None
         if self.pool_grid:
@@ -58,9 +64,140 @@ class Sapiens2Wrapper(nn.Module):
         (FREEZE: False) has to ask for it.
         """
         self.backbone.gradient_checkpointing_enable()
-        if hasattr(self.backbone, 'enable_input_require_grads'):
+        if self._ckpt_input_grads and hasattr(self.backbone, 'enable_input_require_grads'):
             self.backbone.enable_input_require_grads()
-        print('Backbone gradient checkpointing enabled.')
+        print(f'Backbone gradient checkpointing enabled '
+              f'(input_require_grads={self._ckpt_input_grads}).')
+
+    def _layers(self):
+        """The trunk's transformer block list (`model.layer` for Sapiens2)."""
+        import torch.nn as nn
+        best = None
+        for _, mod in self.backbone.named_modules():
+            if isinstance(mod, nn.ModuleList) and len(mod) > 8:
+                if best is None or len(mod) > len(best):
+                    best = mod
+        if best is None:
+            raise RuntimeError('could not find the transformer layer list')
+        return best
+
+    def truncate_layers(self, n):
+        """Keep only the first n transformer blocks.
+
+        A smaller trunk than the released checkpoints offer: 24 of the 0.8b's 32
+        blocks measures 0.604B, since there is no 0.4b checkpoint to load (a real
+        0.4b would need a narrower hidden size, not fewer layers). The kept
+        blocks retain their pretrained weights; the discarded ones are the
+        deepest, which is the usual place to cut a ViT for a cheaper feature
+        extractor.
+        """
+        layers = self._layers()
+        if n >= len(layers):
+            return
+        del layers[n:]
+        cfg = self.backbone.config
+        cfg.num_hidden_layers = n
+        # The trunk emits feature maps at `out_indices`, which still point at
+        # stage 32. Left alone, forward() returns feature_maps=None and dies with
+        # "'NoneType' object is not subscriptable" -- the deleted layers are not
+        # the problem, the dangling output stage is. Retarget it to the new last
+        # block, and trim the per-layer lists that are indexed by depth.
+        if getattr(cfg, 'stage_names', None):
+            cfg.stage_names = cfg.stage_names[:n + 1]
+        cfg.out_indices = [n]
+        cfg.out_features = [f'stage{n}']
+        kv = getattr(cfg, 'num_key_value_heads_per_layer', None)
+        if kv and len(kv) > n:
+            cfg.num_key_value_heads_per_layer = kv[:n]
+        # The module caches these at construction, so setting the config alone
+        # is not enough.
+        for attr, val in (('out_indices', cfg.out_indices),
+                          ('out_features', cfg.out_features),
+                          ('stage_names', getattr(cfg, 'stage_names', None))):
+            if val is not None and hasattr(self.backbone, attr):
+                setattr(self.backbone, attr, val)
+        tot = sum(p.numel() for p in self.backbone.parameters())
+        print(f'Backbone truncated to {n} layers ({tot / 1e9:.3f}B params), '
+              f'output stage -> {cfg.out_features[0]}.')
+
+    def freeze_above_layer(self, k):
+        """Train the first k blocks (plus patch embed); freeze everything above.
+
+        NOTE this is the opposite of the usual recipe. Fine-tuning normally
+        adapts the LAST blocks, the ones feeding the task head, and leaves the
+        generic early features alone. Training the first k means the frozen
+        upper blocks must consume features that are moving underneath them.
+        Supported because it was asked for, not because it is the safe default.
+        """
+        layers = self._layers()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        for i in range(min(k, len(layers))):
+            for p in layers[i].parameters():
+                p.requires_grad = True
+        tr = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        tot = sum(p.numel() for p in self.backbone.parameters())
+        print(f'Backbone: first {k} of {len(layers)} blocks trainable '
+              f'({tr / 1e6:.0f}M of {tot / 1e6:.0f}M params).')
+        # Gradients must reach block k-1, so the trunk still needs train mode and
+        # recomputation; this is NOT the frozen path.
+        self._frozen = False
+        self._ckpt_input_grads = False
+        self.backbone.train()
+
+    def freeze_below_layer(self, k):
+        """Train the LAST k blocks; freeze everything below them.
+
+        The cheap direction, and the conventional one. Backward terminates at the
+        first trainable block, so every block below it is forward-only -- unlike
+        freeze_above_layer, where gradients must still traverse the frozen upper
+        blocks to reach the trainable lower ones and only their weight gradients
+        are skipped.
+        """
+        layers = self._layers()
+        n = len(layers)
+        k = min(k, n)
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        for i in range(n - k, n):
+            for p in layers[i].parameters():
+                p.requires_grad = True
+        tr = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        tot = sum(p.numel() for p in self.backbone.parameters())
+        print(f'Backbone: last {k} of {n} blocks trainable '
+              f'({tr / 1e6:.0f}M of {tot / 1e6:.0f}M params); blocks 0-{n - k - 1} '
+              f'forward-only.')
+        self._frozen = False
+        self._ckpt_input_grads = False
+        self.backbone.train()
+
+    def enable_fp8_training(self):
+        """Swap the trunk's Linears for torchao Float8Linear (real FP8 training).
+
+        NOT the same thing as MODEL.BACKBONE.FP8, which calls torchao's
+        *inference* quantize_() and refuses to run unless the backbone is fully
+        frozen, because it replaces weights with non-trainable quantized tensors.
+        This keeps master weights in bf16 and runs the matmuls in fp8 with
+        dynamic scaling, so gradients still flow -- which is what a partial
+        fine-tune needs.
+
+        Requires torch.compile. Measured on sm_120 for one 1280->5120->1280
+        block at 3072 tokens: bf16 14.35 ms, fp8 eager 43.75 ms (3x SLOWER, the
+        scale/cast ops dominate), fp8 compiled 10.67 ms (1.35x). Enabling this
+        without TORCH_COMPILE is a pessimisation, so it says so.
+        """
+        from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+        # fp8 matmuls need both inner dims divisible by 16; skip anything else
+        # rather than let torchao fall back silently per-layer.
+        def ok(mod, fqn):
+            import torch.nn as nn
+            return (isinstance(mod, nn.Linear)
+                    and mod.in_features % 16 == 0 and mod.out_features % 16 == 0)
+        convert_to_float8_training(self.backbone, config=Float8LinearConfig(),
+                                   module_filter_fn=ok)
+        n = sum(1 for m in self.backbone.modules() if 'Float8' in type(m).__name__)
+        print(f'FP8 training enabled on {n} Linear layers (torchao float8).')
+        return n
 
     def freeze_pretrained(self):
         """Freeze Sapiens2 itself, leaving the projection trainable."""

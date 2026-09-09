@@ -65,7 +65,26 @@ class HaworFull(pl.LightningModule):
             print(f'Backbone {cfg.MODEL.BACKBONE.TYPE} loaded its own pretrained weights')
         else:
             print('WARNING: init backbone from scratch !!!')
-        if cfg.MODEL.BACKBONE.get('FREEZE', True):
+        # Optional smaller trunk: keep only the first N blocks. Applied before
+        # any freezing so the two compose.
+        nl = cfg.MODEL.BACKBONE.get('NUM_LAYERS', 0)
+        if nl and hasattr(self.backbone, 'truncate_layers'):
+            self.backbone.truncate_layers(int(nl))
+
+        # Partial fine-tune: train the first K blocks, freeze the rest. Distinct
+        # from FREEZE (nothing trains) and from LORA (adapters everywhere).
+        # Positive K trains the FIRST K blocks; negative trains the LAST |K|.
+        # The sign matters for speed, not just for which weights move: with the
+        # last blocks trainable, backward stops at the first trainable block and
+        # everything below is forward-only. With the first blocks trainable,
+        # gradients still traverse every frozen block above to reach them.
+        tl = int(cfg.MODEL.BACKBONE.get('TRAINABLE_LAYERS', 0))
+        if tl > 0 and hasattr(self.backbone, 'freeze_above_layer'):
+            self.backbone.freeze_above_layer(tl)
+        elif tl < 0 and hasattr(self.backbone, 'freeze_below_layer'):
+            self.backbone.freeze_below_layer(-tl)
+
+        if not tl and cfg.MODEL.BACKBONE.get('FREEZE', True):
             if self_pretrained:
                 self.backbone.freeze_pretrained()
             else:
@@ -99,6 +118,13 @@ class HaworFull(pl.LightningModule):
                 grad_checkpoint=cfg.MODEL.BACKBONE.get('GRAD_CHECKPOINT', True))
             if cfg.MODEL.BACKBONE.get('FP8', False):
                 print('NOTE: FP8 skipped because LoRA needs gradients through the trunk.')
+        elif cfg.MODEL.BACKBONE.get('FP8_TRAINING', False):
+            # Real fp8 TRAINING (gradients flow), unlike FP8 which is inference
+            # quantization and skips itself unless the backbone is fully frozen.
+            if not cfg.MODEL.BACKBONE.get('TORCH_COMPILE', 0):
+                print('WARNING: FP8_TRAINING without TORCH_COMPILE is ~3x SLOWER '
+                      'than bf16; the cast/scale ops need fusing.')
+            self.backbone.enable_fp8_training()
         elif cfg.MODEL.BACKBONE.get('FP8', False):
             from lib.models.hawor import HAWOR
             HAWOR._quantize_backbone_fp8(self)
