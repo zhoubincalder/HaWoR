@@ -55,9 +55,24 @@ MODEL:
   # to 512 or 1024 works if you want to test that trade-off.
   IMAGE_SIZE: 256
   # Full-frame input, letterboxed, at Sapiens2's native pretraining scale.
-  # Sapiens2's config says 1024x768 as HxW (portrait); HOT3D and ARCTIC frames
-  # are landscape, so this is the transpose -- the same pixel count and patch
-  # grid, which is what RoPE and the patch embedding care about.
+  # Sapiens2's config says 1024x768 as HxW (portrait); five of the six datasets
+  # are landscape (HOT3D is square 704x704), so this is the transpose -- the
+  # same pixel count and patch grid, which is what RoPE and the patch embedding
+  # care about.
+  # NOTE this UPSAMPLES 93.8% of the corpus. Source sizes, letterbox scale into
+  # 1024x768, canvas fill and share of an epoch's frame-slots:
+  #   dexycb  640x480   1.600x  100.0%  39.4%     ho3d   640x480  1.600x  8.5%
+  #   hot3d   704x704   1.091x   75.0%  22.1%     h2o   1280x720  0.800x  6.2%
+  #   arctic  840x600   1.219x   95.2%  17.8%     h2o3d  640x480  1.600x  6.0%
+  # Weighted mean 1.370x linear = 1.88x the source pixels; only H2O is genuinely
+  # downsampled. DexYCB + HO3D + H2O3D are 53.9% of the epoch and are native
+  # 640x480, so at INPUT 640x480 they would be pixel-exact -- the interpolation
+  # up to 1024x768 costs 2.56x the tokens for no added information. Against
+  # that, hand spans (median longest bbox side) fall from a corpus-weighted
+  # 171px to 107px, where original HaWoR's 256x192 crop gave a hand ~213px.
+  # The 5.70mm shift measured for 640x480 in scripts/probe_token_reduction.py
+  # was measured on HOT3D, which 640x480 really does downsample (0.682x), so it
+  # is a near-worst case for the corpus rather than a best one.
   # The backbone grid is 48x64 = 3072 tokens and is kept at full resolution:
   # MANOTwoHandHead flattens it into a cross-attention context and has only two
   # query tokens, so the context length is nearly free. Measured against the
