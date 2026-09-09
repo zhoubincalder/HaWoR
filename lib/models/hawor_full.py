@@ -54,6 +54,8 @@ class HaworFull(pl.LightningModule):
         self.seq_len = cfg.MODEL.get('SEQ_LEN', 16)
         self.in_h = cfg.MODEL.get('INPUT_H', 384)
         self.in_w = cfg.MODEL.get('INPUT_W', 512)
+        # 0 = recompute every step (the plain GRAD_CHECKPOINT behaviour).
+        self._ckpt_above = int(cfg.MODEL.BACKBONE.get('CKPT_ABOVE_TOKENS', 0))
 
         self.backbone = create_backbone(cfg)
         self.backbone_frozen = False
@@ -239,6 +241,14 @@ class HaworFull(pl.LightningModule):
     def forward_step(self, batch: Dict, train: bool = False) -> Dict:
         img = batch['img']                                    # (B,T,3,H,W)
         B, T = img.shape[:2]
+        # Recompute activations only for the windows that would not otherwise
+        # fit. Peak memory is linear in tokens (~0.04GB/token plus ~10GB of
+        # weights and optimizer state), so under NATIVE_RES most windows are
+        # small enough to keep their activations and skip the ~30% recompute
+        # cost, while the largest few still need it.
+        if self._ckpt_above and self.training:
+            tok = (img.shape[-2] // 16) * (img.shape[-1] // 16)
+            self.backbone.set_checkpointing(tok > self._ckpt_above)
         feat = self.backbone(img.flatten(0, 1)).float()        # (B*T,C,h,w)
 
         tok = self.head(feat, return_tokens=True)              # (B*T,2,1024)

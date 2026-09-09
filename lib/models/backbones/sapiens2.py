@@ -70,8 +70,31 @@ class Sapiens2Wrapper(nn.Module):
         self.backbone.gradient_checkpointing_enable()
         if self._ckpt_input_grads and hasattr(self.backbone, 'enable_input_require_grads'):
             self.backbone.enable_input_require_grads()
+        self._ckpt_enabled = True
         print(f'Backbone gradient checkpointing enabled '
               f'(input_require_grads={self._ckpt_input_grads}).')
+
+    def set_checkpointing(self, on):
+        """Turn recomputation on or off for the NEXT forward.
+
+        Under MODEL.NATIVE_RES the input size varies per window, and so does
+        peak memory -- measured on a 96GB card at batch 1, full fine-tune, no
+        recomputation: 53.7GB at 1089 tokens, 58.6 at 1200, 72.9 at 1521, 91.0
+        at 1936, and OOM at 2014. So the right answer is per batch, not per run:
+        recompute only the windows that need it.
+
+        Sapiens2Layer is a transformers GradientCheckpointingLayer, which reads
+        `self.gradient_checkpointing` inside its own __call__, so flipping the
+        flag between steps is safe. It is only meaningful once
+        gradient_checkpointing_enable() has installed the checkpoint function,
+        hence the guard -- setting the flag without it would fail at the call.
+        """
+        if not getattr(self, '_ckpt_enabled', False):
+            return False
+        on = bool(on)
+        for layer in self._layers():
+            layer.gradient_checkpointing = on
+        return on
 
     def _layers(self):
         """The trunk's transformer block list (`model.layer` for Sapiens2)."""

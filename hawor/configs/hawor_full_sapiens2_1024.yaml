@@ -139,6 +139,19 @@ MODEL:
     # Mandatory here. Without recomputation this config needs >99 GB and OOMs;
     # with it, 15.8 GB at batch 1. Costs ~30% step time.
     GRAD_CHECKPOINT: True
+    # 0 = recompute every step. A positive N recomputes ONLY windows with more
+    # than N patch tokens, which is what makes NATIVE_RES's varying input size
+    # worth exploiting: peak memory is linear in tokens, measured at batch 1 on
+    # a 96GB card with a full fine-tune and no recomputation --
+    #   1089 tok 53.7 GB   1200 tok 58.6 GB   1521 tok 72.9 GB
+    #   1936 tok 91.0 GB   2014 tok OOM       2304 tok OOM
+    # so a blanket GRAD_CHECKPOINT: False crashes on ARCTIC and H2O while
+    # leaving 78 GB unused on DexYCB. 1550 keeps the largest un-recomputed
+    # window at 1521 tokens (72.9 GB, ~23 GB spare) and covers ~83% of an
+    # epoch's windows: every DexYCB/HO3D/H2O3D window at any jitter level, plus
+    # HOT3D and ARCTIC at the two lower levels. 1936 also fits but leaves under
+    # 5 GB, which is not enough for a multi-day run.
+    CKPT_ABOVE_TOKENS: 0
     # No POOL_GRID: keep the backbone's native 48x64 grid.
     TORCH_COMPILE: 0
     # Both 0 = off. NUM_LAYERS keeps only the first N transformer blocks, for a
