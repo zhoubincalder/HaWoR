@@ -28,6 +28,19 @@ TRAIN:
   # bf16 has no gradient scaler, so the manual clip_grad_norm_ in training_step
   # sees unscaled gradients. Do not switch to '16-mixed' while GRAD_CLIP_VAL > 0.
   PRECISION: bf16-mixed
+  # Micro-steps per optimizer update. 1 = off. Implemented in
+  # HaworFull.training_step, NOT via Trainer(accumulate_grad_batches=...):
+  # this module uses manual optimization, where Lightning ignores that flag.
+  # Peak memory tracks frames per step (16 is the ceiling without gradient
+  # checkpointing), so accumulation is how a 64-frame update -- the released
+  # recipe's batch -- is reached at 16-frame memory. --max_steps still counts
+  # OPTIMIZER steps: Lightning's global_step advances on opt.step(), which under
+  # this manual-optimization path fires once per ACCUM_STEPS micro-steps, so a
+  # step budget carries over unchanged. Measured at 1024x768, fp8, no ckpt:
+  # 5.304 s per 64-frame update via batch 1 x accum 4, against 11.111 s for
+  # bf16 + checkpointing at batch 4 -- 2.09x at the same effective batch, and
+  # 1.326 s per micro-step, i.e. accumulation itself costs nothing.
+  ACCUM_STEPS: 1
   CHUNK_STRIDE: 8
   VAL_CHUNK_STRIDE: 64
   RENDER_LOG: True

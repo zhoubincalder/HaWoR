@@ -24,8 +24,11 @@ LO="${LO:-20}"; HI="${HI:-60}"; BS="${BS:-4}"
 # Frames per window. Hardcoding 16 here silently doubled the reported
 # frames/s for a SEQ_LEN 8 run, so it is a parameter.
 SEQ="${SEQ:-16}"
+# Frames per OPTIMIZER step. Lightning counts max_steps in optimizer steps,
+# so with accumulation each counted step covers ACCUM micro-batches.
+ACCUM="${ACCUM:-1}"
 mkdir -p "$OUT"
-echo "$NAME: batch $BS x seq_len $SEQ = $((BS*SEQ)) frames/step, "\
+echo "$NAME: batch $BS x seq_len $SEQ x accum $ACCUM = $((BS*SEQ*ACCUM)) frames/update, "\
      "slope from $LO vs $HI steps, opts: $*"
 
 # Warm the inductor cache FIRST. torch.compile persists its artifacts to disk,
@@ -71,8 +74,8 @@ for n in "$LO" "$HI"; do
 done
 
 wlo=$(cat "$OUT/${LO}.wall"); whi=$(cat "$OUT/${HI}.wall")
-awk -v a="$wlo" -v b="$whi" -v lo="$LO" -v hi="$HI" -v bs="$BS" -v sq="$SEQ" -v nm="$NAME" \
+awk -v a="$wlo" -v b="$whi" -v lo="$LO" -v hi="$HI" -v bs="$BS" -v sq="$SEQ" -v ac="$ACCUM" -v nm="$NAME" \
   'BEGIN{t=(b-a)/(hi-lo);
-   printf "\n%s: %.3f s/step   %.1f frames/s   (%d frames/step, startup+compile ~%.0fs)\n", \
-          nm, t, bs*sq/t, bs*sq, a-lo*t}'
+   printf "\n%s: %.3f s/update   %.1f frames/s   (%d frames/update, startup+compile ~%.0fs)\n", \
+          nm, t, bs*sq*ac/t, bs*sq*ac, a-lo*t}'
 echo DONE

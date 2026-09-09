@@ -316,14 +316,39 @@ class HaworFull(pl.LightningModule):
         loss = self.compute_loss(batch, out, train=True)
         if torch.isnan(loss):
             raise ValueError('Loss is NaN')
-        opt.zero_grad()
-        self.manual_backward(loss)
-        if self.cfg.TRAIN.get('GRAD_CLIP_VAL', 0) > 0:
-            gn = torch.nn.utils.clip_grad_norm_(self.get_parameters(),
-                                                self.cfg.TRAIN.GRAD_CLIP_VAL)
-            self.log('train/grad_norm', gn, on_step=True, prog_bar=True,
-                     batch_size=batch['img'].shape[0])
-        opt.step()
+
+        # Gradient accumulation, implemented here because this module sets
+        # automatic_optimization = False -- under manual optimization Lightning
+        # IGNORES Trainer(accumulate_grad_batches=...), so setting that flag
+        # would silently do nothing.
+        #
+        # Why it matters: peak memory tracks frames per step, and 16 frames is
+        # the ceiling without gradient checkpointing. Accumulation reaches the
+        # released recipe's 64-frame update at 16-frame memory, which is what
+        # makes the fp8/no-checkpoint path usable rather than merely fast at a
+        # batch too small to train with.
+        n = max(1, int(self.cfg.TRAIN.get('ACCUM_STEPS', 1)))
+        first = (batch_idx % n) == 0
+        last = ((batch_idx + 1) % n) == 0
+
+        if first:
+            opt.zero_grad()
+        # LOSS_REDUCTION is 'mean', so each micro-batch returns a mean over its
+        # own frames. Dividing by n makes the accumulated gradient the mean over
+        # the whole effective batch rather than n times it -- without this the
+        # effective learning rate scales with ACCUM_STEPS.
+        self.manual_backward(loss / n)
+
+        if last:
+            if self.cfg.TRAIN.get('GRAD_CLIP_VAL', 0) > 0:
+                # Clip the ACCUMULATED gradient, once per update. Clipping each
+                # micro-step would clip partial gradients and change the
+                # direction of the update, not just its norm.
+                gn = torch.nn.utils.clip_grad_norm_(self.get_parameters(),
+                                                    self.cfg.TRAIN.GRAD_CLIP_VAL)
+                self.log('train/grad_norm', gn, on_step=True, prog_bar=True,
+                         batch_size=batch['img'].shape[0])
+            opt.step()
         self.log('train/loss', out['losses']['loss'], on_step=True, prog_bar=True,
                  batch_size=batch['img'].shape[0])
         return out
