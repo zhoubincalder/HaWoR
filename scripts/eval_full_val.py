@@ -8,9 +8,14 @@ corpus-weighted. What each one isolates:
   PA-MPJPE   after a similarity transform (Procrustes). Shape and articulation
              with global rotation AND scale removed, so it is the kindest of
              the three and the one least sensitive to depth ambiguity.
-  2D error   reprojection against the stored 2D labels, reported in SOURCE
-             image pixels so datasets at different resolutions compare.
-  root z     depth of the wrist. NOTE the annotations store only wrist-relative
+  2D error   reprojection against the stored 2D labels, in INPUT-frame pixels.
+             Those equal source pixels only where the letterbox scale is 1
+             (dexycb, ho3d, h2o3d); for hot3d, arctic and h2o the source-pixel
+             error is larger by 1/s (1.13x, 1.14x, 1.55x).
+  root z     depth of the wrist, taken from pred_trans -- NOT from
+             pred_keypoints_3d, which forward_step fills with untranslated
+             MANO-frame joints whose wrist sits near the origin. NOTE the
+             annotations store only wrist-relative
              3D and 2D pixels -- there is no stored absolute translation -- so
              the reference here is DERIVED by least-squares fitting the GT 3D
              onto the GT 2D through the known intrinsics. It is a reconstruction
@@ -117,6 +122,12 @@ def main():
     ap.add_argument('--stride', type=int, default=256)
     ap.add_argument('--max_windows', type=int, default=60, help='per dataset')
     ap.add_argument('--only', nargs='*', default=None)
+    ap.add_argument('--canvas', nargs=2, type=int, default=None, metavar=('H', 'W'),
+                    help='evaluate in fixed-canvas letterbox mode at HxW instead '
+                         'of NATIVE_RES. Needed to score a checkpoint at the '
+                         'resolution it was trained on -- running a 384x512 '
+                         'canvas model under native res measures the mismatch, '
+                         'not the model.')
     args = ap.parse_args()
 
     from hawor.configs import get_config
@@ -125,8 +136,14 @@ def main():
 
     cfg = get_config(args.cfg, merge=True, update_cachedir=True)
     cfg.defrost()
-    cfg.MODEL.NATIVE_RES = True
-    cfg.MODEL.MAX_TOKENS = 1550
+    if args.canvas:
+        cfg.MODEL.NATIVE_RES = False
+        cfg.MODEL.INPUT_H, cfg.MODEL.INPUT_W = args.canvas
+        cfg.MODEL.MAX_TOKENS = 0
+        print(f'canvas mode: {args.canvas[0]}x{args.canvas[1]}')
+    else:
+        cfg.MODEL.NATIVE_RES = True
+        cfg.MODEL.MAX_TOKENS = 1550
     cfg.MODEL.RES_JITTER_LEVELS = []
     cfg.TRAIN.BATCH_SIZE = 1
     cfg.MODEL.BACKBONE.FREEZE = True
@@ -169,8 +186,14 @@ def main():
                       for k, v in b.items()}
                 o = model.forward_step(bb, train=False)
                 # already (B*T,2,J,3) with B=1, so no batch axis to strip
+                # forward_step appends `j` (MANO-frame joints, wrist near the
+                # origin) to pred_keypoints_3d, NOT the translated `pts`. So
+                # camera-space depth lives in pred_trans, and reading
+                # pred_keypoints_3d[..., 0, 2] gives a near-constant ~0.006 that
+                # is the same for every checkpoint.
                 p3 = o['pred_keypoints_3d'].cpu().numpy()         # (T,2,J,3)
                 p2 = o['pred_keypoints_2d'].cpu().numpy()
+                ptr = o['pred_trans'].cpu().numpy()               # (T,2,3)
                 g3 = b['gt_j3d_wo_trans'].numpy()
                 g2 = b['gt_j2d'].numpy()
                 gc = b['gt_j2d_conf'].numpy()
@@ -196,8 +219,12 @@ def main():
                     if w2.any():
                         e2d.append(np.linalg.norm(d2, axis=-1)[w2].mean())
                     # root depth vs a GT fitted from the stored 2D + relative 3D
-                    tg = fit_root_depth(gtw, g2[m, slot] * px, foc, ctr)
-                    zp = pr[:, 0, 2]
+                    # gt_j2d is stored as pixels/[W,H] - 0.5, so absolute
+                    # pixels need the +0.5 back. Omitting it shifts every
+                    # point by half the frame and the depth fit becomes
+                    # dominated by that offset rather than the prediction.
+                    tg = fit_root_depth(gtw, (g2[m, slot] + 0.5) * px, foc, ctr)
+                    zp = ptr[m, slot, 2]
                     ok = np.isfinite(tg[:, 2])
                     if ok.any():
                         ez.append(np.abs(zp[ok] - tg[ok, 2]).mean() * 1000)
