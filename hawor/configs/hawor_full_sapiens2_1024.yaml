@@ -20,11 +20,33 @@ TRAIN:
   # backbone frozen and want the head phase to converge faster.
   LR: 1.0e-5
   WEIGHT_DECAY: 1.0e-4
+  # The trunk's LR as a fraction of LR above. 1.0 = one flat rate for
+  # everything, which is the released recipe. Lower it when the head starts
+  # from random init: 50M new parameters against an 815M pretrained trunk, and
+  # without this the trunk is rewritten by a head that does not yet know
+  # anything. Measured on the run without it: gradient norm ~9 with no decay
+  # over 4000 steps and the loss flat at ~0.176 from step 3100.
+  BACKBONE_LR_MULT: 0.1
+  # Linear ramp from 0, counted in OPTIMIZER steps. The standard remedy for the
+  # large early gradients a from-scratch head produces.
+  WARMUP_STEPS: 500
+  # Cosine horizon in optimizer steps; 0 derives it from the trainer's estimate
+  # divided by ACCUM_STEPS. One epoch is 110261/ACCUM_STEPS steps, so at
+  # ACCUM_STEPS 4 that is 27565 per epoch -- set this to the number of epochs
+  # you actually intend, or the decay is shaped by the NUM_EPOCHS placeholder.
+  COSINE_STEPS: 0
+  # Cosine floor as a fraction of peak LR.
+  MIN_LR_RATIO: 0.05
   # 15 h/epoch at this resolution, so validate more often than once an epoch.
   # 'mean' (release default) averages the per-sample loss over the batch;
   # 'sum' is the HaMeR convention and makes the effective LR scale with B*16.
   LOSS_REDUCTION: mean
-  GRAD_CLIP_VAL: 1.0
+  # 1.0 is the released value, but that recipe warm-started its head. With a
+  # from-scratch head the measured norm is 4-16, so a clip of 1.0 fires on
+  # EVERY update and turns the optimizer into normalized descent at a fixed
+  # step of LR -- the magnitude information never reaches it. 5 lets ordinary
+  # updates through while still catching the 15+ spikes.
+  GRAD_CLIP_VAL: 5.0
   # bf16 has no gradient scaler, so the manual clip_grad_norm_ in training_step
   # sees unscaled gradients. Do not switch to '16-mixed' while GRAD_CLIP_VAL > 0.
   PRECISION: bf16-mixed

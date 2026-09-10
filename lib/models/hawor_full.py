@@ -21,11 +21,13 @@ Differences from the crop model in hawor.py:
   per-location attention no longer tracks a hand.
 - A per-hand visibility logit, since hands routinely leave the frame.
 """
+import math
 from typing import Dict
 
 import einops
 import numpy as np
 import pytorch_lightning as pl
+
 import torch
 from yacs.config import CfgNode
 
@@ -231,10 +233,65 @@ class HaworFull(pl.LightningModule):
         return p
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
-            [{'params': filter(lambda q: q.requires_grad, self.get_parameters()),
-              'lr': self.cfg.TRAIN.LR}],
-            weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
+        """AdamW with a lower LR on the pretrained trunk, linear warmup, cosine decay.
+
+        Three departures from the released recipe's single flat 1e-5, all aimed
+        at the same thing: a 50M-parameter head starting from random init sends
+        large, uninformative gradients into an 815M pretrained trunk from step
+        one. Measured on the first run without them, the gradient norm sat at
+        ~9 (spiking to 16.4) for 4000 steps with no decay, every update was
+        clipped, and the running-mean loss plateaued at ~0.176 by step 3100.
+
+          * TRAIN.BACKBONE_LR_MULT scales the trunk's LR relative to the head's,
+            so the pretrained features are not overwritten while the head is
+            still noise.
+          * TRAIN.WARMUP_STEPS ramps linearly from zero, which is the standard
+            remedy for exactly those large early gradients.
+          * cosine decay to TRAIN.MIN_LR_RATIO of peak over TRAIN.COSINE_STEPS
+            optimizer steps (0 = derive from the trainer's estimate).
+
+        LambdaLR multiplies each group's own base_lr, so warmup and decay apply
+        to both groups while preserving the ratio between them.
+        """
+        base = float(self.cfg.TRAIN.LR)
+        mult = float(self.cfg.TRAIN.get('BACKBONE_LR_MULT', 1.0))
+        # self.backbone may be an OptimizedModule by now; .parameters() forwards
+        # to the wrapped module, so these are the same tensors either way.
+        trunk = [q for q in self.backbone.parameters() if q.requires_grad]
+        trunk_ids = {id(q) for q in trunk}
+        rest = [q for q in self.get_parameters()
+                if q.requires_grad and id(q) not in trunk_ids]
+        groups = [{'params': trunk, 'lr': base * mult},
+                  {'params': rest, 'lr': base}]
+        opt = torch.optim.AdamW(groups, weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
+        print(f'AdamW: backbone lr {base * mult:.2e} ({len(trunk)} tensors), '
+              f'head lr {base:.2e} ({len(rest)} tensors)')
+
+        warm = max(0, int(self.cfg.TRAIN.get('WARMUP_STEPS', 0)))
+        total = int(self.cfg.TRAIN.get('COSINE_STEPS', 0))
+        if total <= 0:
+            # estimated_stepping_batches counts BATCHES here, because this
+            # module drives accumulation itself rather than through
+            # Trainer(accumulate_grad_batches=...), which it ignores.
+            n = max(1, int(self.cfg.TRAIN.get('ACCUM_STEPS', 1)))
+            try:
+                total = max(1, int(self.trainer.estimated_stepping_batches) // n)
+            except Exception:
+                total = warm + 1
+        floor = float(self.cfg.TRAIN.get('MIN_LR_RATIO', 0.05))
+        print(f'LR schedule: {warm} warmup steps, cosine to {floor:.0%} of peak '
+              f'over {total} optimizer steps')
+
+        def lr_lambda(step):
+            if warm and step < warm:
+                return (step + 1) / warm
+            span = max(1, total - warm)
+            prog = min(1.0, max(0.0, (step - warm) / span))
+            return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * prog))
+
+        sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        return {'optimizer': opt,
+                'lr_scheduler': {'scheduler': sch, 'interval': 'step'}}
 
     def cam_to_trans(self, cam, focal, center, size=None):
         """(u_norm, v_norm, log_depth) -> camera-space translation, via the known
@@ -397,6 +454,15 @@ class HaworFull(pl.LightningModule):
                 self.log('train/grad_norm', gn, on_step=True, prog_bar=True,
                          batch_size=batch['img'].shape[0])
             opt.step()
+            # Manual optimization: Lightning does NOT step schedulers for us,
+            # and it must advance once per OPTIMIZER step, not once per batch.
+            sch = self.lr_schedulers()
+            if sch is not None:
+                sch.step()
+                lrs = [g['lr'] for g in opt.param_groups]
+                self.log('lr/backbone', lrs[0], on_step=True, batch_size=1)
+                if len(lrs) > 1:
+                    self.log('lr/head', lrs[-1], on_step=True, batch_size=1)
         bs = batch['img'].shape[0]
         raw = out['losses']['loss']
         self.log('train/loss', raw, on_step=True, prog_bar=True, batch_size=bs)
