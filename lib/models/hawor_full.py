@@ -56,6 +56,8 @@ class HaworFull(pl.LightningModule):
         self.in_w = cfg.MODEL.get('INPUT_W', 512)
         # 0 = recompute every step (the plain GRAD_CHECKPOINT behaviour).
         self._ckpt_above = int(cfg.MODEL.BACKBONE.get('CKPT_ABOVE_TOKENS', 0))
+        self._loss_hist = []
+        self._loss_hist_n = max(1, int(cfg.TRAIN.get('RUNNING_MEAN_WINDOW', 200)))
 
         self.backbone = create_backbone(cfg)
         self.backbone_frozen = False
@@ -395,8 +397,27 @@ class HaworFull(pl.LightningModule):
                 self.log('train/grad_norm', gn, on_step=True, prog_bar=True,
                          batch_size=batch['img'].shape[0])
             opt.step()
-        self.log('train/loss', out['losses']['loss'], on_step=True, prog_bar=True,
-                 batch_size=batch['img'].shape[0])
+        bs = batch['img'].shape[0]
+        raw = out['losses']['loss']
+        self.log('train/loss', raw, on_step=True, prog_bar=True, batch_size=bs)
+
+        # A single-window loss is dominated by WHICH dataset the batch drew, so
+        # the raw curve is close to unreadable at BATCH_SIZE 1. Two additions
+        # make it diagnostic: a running mean over the last RUNNING_MEAN_WINDOW
+        # micro-steps, which averages the dataset mixture out, and one scalar
+        # per dataset, which removes the mixture entirely.
+        self._loss_hist.append(float(raw))
+        if len(self._loss_hist) > self._loss_hist_n:
+            self._loss_hist.pop(0)
+        self.log('train/loss_mean', sum(self._loss_hist) / len(self._loss_hist),
+                 on_step=True, prog_bar=True, batch_size=bs)
+
+        name = batch.get('ds_name')
+        if name is not None:
+            # default_collate turns the per-sample string into a list.
+            name = name[0] if isinstance(name, (list, tuple)) else name
+            self.log(f'train_ds/{name}', raw, on_step=True, prog_bar=False,
+                     batch_size=bs)
         return out
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):

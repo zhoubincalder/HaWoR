@@ -58,6 +58,8 @@ def check_window(b):
     """
     bad = []
     in_h, in_w = b['img'].shape[-2:]
+    # ds_name is a plain string, so the finite check below must skip non-tensors.
+    b = {k: v for k, v in b.items() if torch.is_tensor(v)}
     if 'img_size' in b:
         sw, sh = (int(x) for x in b['img_size'][0])
         if (sw, sh) != (in_w, in_h):

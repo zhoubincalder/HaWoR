@@ -62,6 +62,11 @@ class HaworFullDataset(torch.utils.data.Dataset):
         self.jitter_levels = list(cfg.MODEL.get('RES_JITTER_LEVELS', []))
         self.max_tokens = int(cfg.MODEL.get('MAX_TOKENS', 0))
         self._budget = {}
+        # Which export this sample came from. train_full.py concatenates six
+        # roots whose loss scales span more than 20x (arctic 0.044 to dexycb
+        # 0.435), so at BATCH_SIZE 1 a single 'train/loss' curve mostly reports
+        # which dataset the batch drew, not whether the model improved.
+        self.ds_name = os.path.basename(os.path.normpath(video_root)).replace('_export', '')
         if self.native_res and cfg.TRAIN.get('BATCH_SIZE', 1) > 1:
             # Fail here rather than in default_collate, which reports only a
             # shape mismatch and does not say why the shapes differ.
@@ -215,6 +220,7 @@ class HaworFullDataset(torch.utils.data.Dataset):
                   (j2d[..., 1] >= 0) & (j2d[..., 1] < out_h)).astype(np.float32)
 
         return {
+            'ds_name': self.ds_name,
             'img': torch.stack(imgs).float(),                                    # (T,3,H,W)
             'img_focal': torch.full((self.seq_len,), focal).float(),
             'img_center': torch.from_numpy(ic).float().unsqueeze(0).repeat(self.seq_len, 1),

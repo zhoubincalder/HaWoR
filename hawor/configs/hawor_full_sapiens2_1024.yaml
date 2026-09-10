@@ -41,6 +41,11 @@ TRAIN:
   # bf16 + checkpointing at batch 4 -- 2.09x at the same effective batch, and
   # 1.326 s per micro-step, i.e. accumulation itself costs nothing.
   ACCUM_STEPS: 1
+  # Micro-steps averaged into train/loss_mean. The raw per-step loss at
+  # BATCH_SIZE 1 reports which of the six datasets the batch drew (their scales
+  # span 0.044 to 0.435), so the mean is the readable curve; train_ds/<name>
+  # splits it per dataset.
+  RUNNING_MEAN_WINDOW: 200
   CHUNK_STRIDE: 8
   VAL_CHUNK_STRIDE: 64
   RENDER_LOG: True
