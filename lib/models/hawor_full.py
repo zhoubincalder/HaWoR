@@ -42,6 +42,11 @@ from lib.utils.geometry import perspective_projection
 from lib.utils.geometry import rot6d_to_rotmat_hmr2 as rot6d_to_rotmat
 
 Z0 = 0.5   # metres; typical egocentric hand distance, so cam[2]=0 starts sensibly
+# Reference focal for the depth decode, in pixels: the corpus median effective
+# focal (dexycb/ho3d/h2o3d all sit at ~615-617). Depth is decoded as
+# Z0 * (f/F_REF) * exp(dz), so at f = F_REF the formula is exactly the old one
+# and those three datasets are unchanged.
+F_REF = 615.0
 
 
 class HaworFull(pl.LightningModule):
@@ -302,14 +307,27 @@ class HaworFull(pl.LightningModule):
         `size` is the per-sample (W, H) of the input tensor, broadcastable against
         cam. Under MODEL.NATIVE_RES every sample carries its own input size, so
         taking it from the config would denormalize (u, v) against the wrong
-        frame -- silently, and by up to 1.6x on the 640x480 datasets."""
+        frame -- silently, and by up to 1.6x on the 640x480 datasets.
+
+        Depth carries the focal length. Apparent size determines depth only up
+        to f: a hand of metric size S at depth z spans about f*S/z pixels, so
+        z = f*S/pixels. The network sees pixels and never sees f -- img_focal is
+        read here, not fed to the backbone -- so decoding z from dz alone asks
+        it to guess a per-camera constant. Measured on the step-9188 checkpoint,
+        root-depth error tracked effective focal at r = 0.859 across the six val
+        folds (hot3d f=270 -> 165mm, arctic f=633 -> 524mm), and the hot3d /
+        dexycb pair pins it exactly: their true depths differ 3.3x while their
+        apparent hand sizes differ only 1.43x, and the residual 2.30 equals
+        f_dexycb/f_hot3d = 2.28 to within 1%. Scaling by f/F_REF makes dz a
+        focal-INDEPENDENT quantity (essentially S/pixels) and lets the geometry
+        supply the rest, which also makes the model valid on an unseen camera."""
         if size is None:
             in_w, in_h = self.in_w, self.in_h
         else:
             in_w, in_h = size[..., 0], size[..., 1]
         u = (cam[..., 0] + 0.5) * in_w
         v = (cam[..., 1] + 0.5) * in_h
-        z = Z0 * torch.exp(cam[..., 2].clamp(-2.0, 2.0))
+        z = Z0 * (focal / F_REF) * torch.exp(cam[..., 2].clamp(-2.0, 2.0))
         tx = (u - center[..., 0]) * z / focal
         ty = (v - center[..., 1]) * z / focal
         return torch.stack([tx, ty, z], dim=-1)
