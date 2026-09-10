@@ -22,6 +22,7 @@ Differences from the crop model in hawor.py:
 - A per-hand visibility logit, since hands routinely leave the frame.
 """
 import math
+from contextlib import nullcontext
 from typing import Dict
 
 import einops
@@ -442,7 +443,21 @@ class HaworFull(pl.LightningModule):
         # own frames. Dividing by n makes the accumulated gradient the mean over
         # the whole effective batch rather than n times it -- without this the
         # effective learning rate scales with ACCUM_STEPS.
-        self.manual_backward(loss / n)
+        # Under DDP every backward triggers an all-reduce of all 864M gradients
+        # (~1.7GB in bf16). Accumulation only pays off if the non-final
+        # micro-steps skip that: otherwise N micro-steps cost N all-reduces and
+        # accumulation ADDS communication instead of amortizing it. The DGX has
+        # no NVLink -- nvidia-smi reports "Device does not have or support
+        # Nvlink" and the topology is all NODE, i.e. PCIe through a host bridge
+        # -- so the collective is expensive enough to matter: per-rank window
+        # time there is 0.754s against 0.535s for the same GPU running alone.
+        sync = nullcontext()
+        if not last:
+            ddp = getattr(self.trainer, 'model', None)
+            if ddp is not None and hasattr(ddp, 'no_sync'):
+                sync = ddp.no_sync()
+        with sync:
+            self.manual_backward(loss / n)
 
         if last:
             if self.cfg.TRAIN.get('GRAD_CLIP_VAL', 0) > 0:
